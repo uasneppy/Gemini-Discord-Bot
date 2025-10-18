@@ -2298,7 +2298,8 @@ function removeEmptyCodeFences(text) {
 
   return withoutEmptyFences
     .replace(/\n{3,}/g, '\n\n')
-    .trimEnd();
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/[ \t]+$/g, '');
 }
 
 function updateEmbed(botMessage, finalResponse, message, groundingMetadata = null, urlContextMetadata = null) {
