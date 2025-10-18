@@ -105,6 +105,7 @@ const defaultServerSettings = config.defaultServerSettings;
 const workInDMs = config.workInDMs;
 const shouldDisplayPersonalityButtons = config.shouldDisplayPersonalityButtons;
 const SEND_RETRY_ERRORS_TO_DISCORD = config.SEND_RETRY_ERRORS_TO_DISCORD;
+const showGroundingMetadata = config.showGroundingMetadata ?? true;
 
 
 
@@ -112,6 +113,34 @@ import {
   delay,
   retryOperation,
 } from './tools/others.js';
+
+const extensionMimeTypeMap = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
+  '.tiff': 'image/tiff',
+  '.svg': 'image/svg+xml',
+  '.heic': 'image/heic',
+  '.heif': 'image/heif',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.flac': 'audio/flac',
+  '.aac': 'audio/aac',
+  '.m4a': 'audio/mp4',
+  '.aif': 'audio/x-aiff',
+  '.aiff': 'audio/x-aiff',
+  '.opus': 'audio/ogg',
+  '.mp4': 'video/mp4',
+  '.mov': 'video/quicktime',
+  '.avi': 'video/x-msvideo',
+  '.mkv': 'video/x-matroska',
+  '.webm': 'video/webm',
+  '.wmv': 'video/x-ms-wmv',
+  '.pdf': 'application/pdf',
+};
 
 // <==========>
 
@@ -531,8 +560,8 @@ function hasSupportedAttachments(message) {
   const supportedFileExtensions = ['.html', '.js', '.css', '.json', '.xml', '.csv', '.py', '.java', '.sql', '.log', '.md', '.txt', '.docx', '.pptx'];
 
   return message.attachments.some((attachment) => {
-    const contentType = (attachment.contentType || "").toLowerCase();
-    const fileExtension = path.extname(attachment.name) || '';
+    const contentType = resolveAttachmentContentType(attachment);
+    const fileExtension = (path.extname(attachment.name) || '').toLowerCase();
     return (
       (contentType.startsWith('image/') && contentType !== 'image/gif') ||
       contentType.startsWith('audio/') ||
@@ -565,6 +594,26 @@ function sanitizeFileName(fileName) {
     .replace(/^-+|-+$/g, '');
 }
 
+const octetStreamPrefixes = ['application/octet-stream', 'binary/octet-stream'];
+
+function resolveAttachmentContentType(attachment) {
+  const directContentType = (attachment.contentType || '').toLowerCase();
+  if (
+    directContentType &&
+    !octetStreamPrefixes.some(prefix => directContentType.startsWith(prefix))
+  ) {
+    return directContentType;
+  }
+
+  const extension = (path.extname(attachment.name) || '').toLowerCase();
+  const mappedType = extensionMimeTypeMap[extension];
+  if (mappedType) {
+    return mappedType;
+  }
+
+  return directContentType || '';
+}
+
 async function processPromptAndMediaAttachments(prompt, message) {
   const attachments = JSON.parse(JSON.stringify(Array.from(message.attachments.values())));
   let parts = [{
@@ -573,7 +622,7 @@ async function processPromptAndMediaAttachments(prompt, message) {
 
   if (attachments.length > 0) {
     const validAttachments = attachments.filter(attachment => {
-      const contentType = (attachment.contentType || "").toLowerCase();
+      const contentType = resolveAttachmentContentType(attachment);
       return (contentType.startsWith('image/') && contentType !== 'image/gif') ||
         contentType.startsWith('audio/') ||
         contentType.startsWith('video/') ||
@@ -591,10 +640,11 @@ async function processPromptAndMediaAttachments(prompt, message) {
           try {
             await downloadFile(attachment.url, filePath);
             // Upload file using new Google GenAI API format
+            const resolvedContentType = resolveAttachmentContentType(attachment);
             const uploadResult = await genAI.files.upload({
               file: filePath,
               config: {
-                mimeType: attachment.contentType,
+                mimeType: resolvedContentType || 'application/octet-stream',
                 displayName: sanitizedFileName,
               }
             });
@@ -604,7 +654,7 @@ async function processPromptAndMediaAttachments(prompt, message) {
               throw new Error(`Unable to extract file name from upload result.`);
             }
 
-            if (attachment.contentType.startsWith('video/')) {
+            if (resolvedContentType.startsWith('video/')) {
               // Wait for video processing to complete using new API
               let file = await genAI.files.get({ name: name });
               while (file.state === 'PROCESSING') {
@@ -643,7 +693,7 @@ async function extractFileText(message, messageContent) {
   if (message.attachments.size > 0) {
     let attachments = Array.from(message.attachments.values());
     for (const attachment of attachments) {
-      const fileType = path.extname(attachment.name) || '';
+      const fileType = (path.extname(attachment.name) || '').toLowerCase();
       const fileTypes = ['.html', '.js', '.css', '.json', '.xml', '.csv', '.py', '.java', '.sql', '.log', '.md', '.txt', '.docx', '.pptx'];
 
       if (fileTypes.includes(fileType)) {
@@ -661,8 +711,8 @@ async function extractFileText(message, messageContent) {
 
 async function downloadAndReadFile(url, fileType) {
   switch (fileType) {
-    case 'pptx':
-    case 'docx':
+    case '.pptx':
+    case '.docx':
       const extractor = getTextExtractor();
       return (await extractor.extractText({
         input: url,
@@ -2021,7 +2071,7 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
         for await (const chunk of messageResult) {
           if (stopGeneration) break;
 
-          const chunkText = (chunk.text || (chunk.codeExecutionResult?.output ? `\n\`\`\`py\n${chunk.codeExecutionResult.output}\n\`\`\`\n` : "") || (chunk.executableCode ? `\n\`\`\`\n${chunk.executableCode}\n\`\`\`\n` : ""));
+          const chunkText = extractDisplayTextFromChunk(chunk);
           if (chunkText && chunkText !== '') {
             finalResponse += chunkText;
             tempResponse += chunkText;
@@ -2142,6 +2192,95 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
   }
 }
 
+function extractDisplayTextFromChunk(chunk) {
+  if (!chunk) {
+    return '';
+  }
+
+  const segments = [];
+  if (!shouldSuppressToolInvocation(chunk) && chunk.text) {
+    segments.push(chunk.text);
+  }
+
+  const rawCodeOutput = chunk.codeExecutionResult?.output;
+  if (typeof rawCodeOutput === 'string') {
+    const trimmedOutput = rawCodeOutput.replace(/\s+$/u, '');
+    if (trimmedOutput.trim() !== '') {
+      segments.push(`\n\`\`\`py\n${trimmedOutput}\n\`\`\`\n`);
+    }
+  }
+
+  const rawExecutableCode = chunk.executableCode;
+  if (typeof rawExecutableCode === 'string') {
+    const trimmedExecutable = rawExecutableCode.replace(/\s+$/u, '');
+    if (trimmedExecutable.trim() !== '') {
+      segments.push(`\n\`\`\`\n${trimmedExecutable}\n\`\`\`\n`);
+    }
+  }
+
+  const combined = segments.join('');
+  return combined ? sanitizeToolCallNarration(combined) : '';
+}
+
+function shouldSuppressToolInvocation(chunk) {
+  if (!chunk) {
+    return false;
+  }
+
+  if (chunk.functionCall || chunk.function_call) {
+    return true;
+  }
+
+  const candidate = chunk.candidates?.[0];
+  if (!candidate) {
+    return false;
+  }
+
+  const contents = Array.isArray(candidate.content) ? candidate.content : (candidate.content ? [candidate.content] : []);
+
+  for (const content of contents) {
+    if (typeof content?.role === 'string') {
+      const normalizedRole = content.role.toLowerCase();
+      if (normalizedRole && normalizedRole !== 'assistant' && normalizedRole !== 'model') {
+        return true;
+      }
+    }
+
+    const parts = Array.isArray(content?.parts) ? content.parts : [];
+    for (const part of parts) {
+      if (part?.functionCall || part?.function_call || part?.toolInvocation || part?.tool_invocation) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function sanitizeToolCallNarration(text) {
+  if (!text) {
+    return '';
+  }
+
+  const toolInvocationPattern = /\b(concise_search|google_search|web_search|search)\s*\(/i;
+  const sanitizedText = text
+    .split(/\r?\n/)
+    .filter(line => !toolInvocationPattern.test(line.trim()))
+    .join('\n');
+
+  return removeEmptyCodeFences(sanitizedText);
+}
+
+function removeEmptyCodeFences(text) {
+  if (!text) {
+    return '';
+  }
+
+  return text
+    .replace(/```[^\n]*\n(?:[ \t]*\n)*```/g, '')
+    .replace(/\n{3,}/g, '\n\n');
+}
+
 function updateEmbed(botMessage, finalResponse, message, groundingMetadata = null, urlContextMetadata = null) {
   try {
     const isGuild = message.guild !== null;
@@ -2235,7 +2374,7 @@ function shouldShowGroundingMetadata(message) {
     ? state.serverSettings[message.guild.id].responseStyle
     : getUserResponsePreference(userId);
   
-  return userResponsePreference === 'Embedded';
+  return showGroundingMetadata && userResponsePreference === 'Embedded';
 }
 
 async function sendAsTextFile(text, message, orgId) {
