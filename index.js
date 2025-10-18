@@ -105,6 +105,7 @@ const defaultServerSettings = config.defaultServerSettings;
 const workInDMs = config.workInDMs;
 const shouldDisplayPersonalityButtons = config.shouldDisplayPersonalityButtons;
 const SEND_RETRY_ERRORS_TO_DISCORD = config.SEND_RETRY_ERRORS_TO_DISCORD;
+const showGroundingMetadata = config.showGroundingMetadata ?? true;
 
 
 
@@ -112,6 +113,34 @@ import {
   delay,
   retryOperation,
 } from './tools/others.js';
+
+const extensionMimeTypeMap = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
+  '.tiff': 'image/tiff',
+  '.svg': 'image/svg+xml',
+  '.heic': 'image/heic',
+  '.heif': 'image/heif',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.flac': 'audio/flac',
+  '.aac': 'audio/aac',
+  '.m4a': 'audio/mp4',
+  '.aif': 'audio/x-aiff',
+  '.aiff': 'audio/x-aiff',
+  '.opus': 'audio/ogg',
+  '.mp4': 'video/mp4',
+  '.mov': 'video/quicktime',
+  '.avi': 'video/x-msvideo',
+  '.mkv': 'video/x-matroska',
+  '.webm': 'video/webm',
+  '.wmv': 'video/x-ms-wmv',
+  '.pdf': 'application/pdf',
+};
 
 // <==========>
 
@@ -531,8 +560,8 @@ function hasSupportedAttachments(message) {
   const supportedFileExtensions = ['.html', '.js', '.css', '.json', '.xml', '.csv', '.py', '.java', '.sql', '.log', '.md', '.txt', '.docx', '.pptx'];
 
   return message.attachments.some((attachment) => {
-    const contentType = (attachment.contentType || "").toLowerCase();
-    const fileExtension = path.extname(attachment.name) || '';
+    const contentType = resolveAttachmentContentType(attachment);
+    const fileExtension = (path.extname(attachment.name) || '').toLowerCase();
     return (
       (contentType.startsWith('image/') && contentType !== 'image/gif') ||
       contentType.startsWith('audio/') ||
@@ -565,6 +594,26 @@ function sanitizeFileName(fileName) {
     .replace(/^-+|-+$/g, '');
 }
 
+const octetStreamPrefixes = ['application/octet-stream', 'binary/octet-stream'];
+
+function resolveAttachmentContentType(attachment) {
+  const directContentType = (attachment.contentType || '').toLowerCase();
+  if (
+    directContentType &&
+    !octetStreamPrefixes.some(prefix => directContentType.startsWith(prefix))
+  ) {
+    return directContentType;
+  }
+
+  const extension = (path.extname(attachment.name) || '').toLowerCase();
+  const mappedType = extensionMimeTypeMap[extension];
+  if (mappedType) {
+    return mappedType;
+  }
+
+  return directContentType || '';
+}
+
 async function processPromptAndMediaAttachments(prompt, message) {
   const attachments = JSON.parse(JSON.stringify(Array.from(message.attachments.values())));
   let parts = [{
@@ -573,7 +622,7 @@ async function processPromptAndMediaAttachments(prompt, message) {
 
   if (attachments.length > 0) {
     const validAttachments = attachments.filter(attachment => {
-      const contentType = (attachment.contentType || "").toLowerCase();
+      const contentType = resolveAttachmentContentType(attachment);
       return (contentType.startsWith('image/') && contentType !== 'image/gif') ||
         contentType.startsWith('audio/') ||
         contentType.startsWith('video/') ||
@@ -591,10 +640,11 @@ async function processPromptAndMediaAttachments(prompt, message) {
           try {
             await downloadFile(attachment.url, filePath);
             // Upload file using new Google GenAI API format
+            const resolvedContentType = resolveAttachmentContentType(attachment);
             const uploadResult = await genAI.files.upload({
               file: filePath,
               config: {
-                mimeType: attachment.contentType,
+                mimeType: resolvedContentType || 'application/octet-stream',
                 displayName: sanitizedFileName,
               }
             });
@@ -604,7 +654,7 @@ async function processPromptAndMediaAttachments(prompt, message) {
               throw new Error(`Unable to extract file name from upload result.`);
             }
 
-            if (attachment.contentType.startsWith('video/')) {
+            if (resolvedContentType.startsWith('video/')) {
               // Wait for video processing to complete using new API
               let file = await genAI.files.get({ name: name });
               while (file.state === 'PROCESSING') {
@@ -643,7 +693,7 @@ async function extractFileText(message, messageContent) {
   if (message.attachments.size > 0) {
     let attachments = Array.from(message.attachments.values());
     for (const attachment of attachments) {
-      const fileType = path.extname(attachment.name) || '';
+      const fileType = (path.extname(attachment.name) || '').toLowerCase();
       const fileTypes = ['.html', '.js', '.css', '.json', '.xml', '.csv', '.py', '.java', '.sql', '.log', '.md', '.txt', '.docx', '.pptx'];
 
       if (fileTypes.includes(fileType)) {
@@ -661,8 +711,8 @@ async function extractFileText(message, messageContent) {
 
 async function downloadAndReadFile(url, fileType) {
   switch (fileType) {
-    case 'pptx':
-    case 'docx':
+    case '.pptx':
+    case '.docx':
       const extractor = getTextExtractor();
       return (await extractor.extractText({
         input: url,
@@ -2235,7 +2285,7 @@ function shouldShowGroundingMetadata(message) {
     ? state.serverSettings[message.guild.id].responseStyle
     : getUserResponsePreference(userId);
   
-  return userResponsePreference === 'Embedded';
+  return showGroundingMetadata && userResponsePreference === 'Embedded';
 }
 
 async function sendAsTextFile(text, message, orgId) {
