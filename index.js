@@ -2066,7 +2066,7 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
         for await (const chunk of messageResult) {
           if (stopGeneration) break;
 
-          const chunkText = (chunk.text || (chunk.codeExecutionResult?.output ? `\n\`\`\`py\n${chunk.codeExecutionResult.output}\n\`\`\`\n` : "") || (chunk.executableCode ? `\n\`\`\`\n${chunk.executableCode}\n\`\`\`\n` : ""));
+          const chunkText = extractDisplayTextFromChunk(chunk);
           if (chunkText && chunkText !== '') {
             finalResponse += chunkText;
             tempResponse += chunkText;
@@ -2185,6 +2185,75 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
   if (activeRequests.has(userId)) {
     activeRequests.delete(userId);
   }
+}
+
+function extractDisplayTextFromChunk(chunk) {
+  if (!chunk) {
+    return '';
+  }
+
+  const segments = [];
+  if (!shouldSuppressToolInvocation(chunk) && chunk.text) {
+    segments.push(chunk.text);
+  }
+
+  if (chunk.codeExecutionResult?.output) {
+    segments.push(`\n\`\`\`py\n${chunk.codeExecutionResult.output}\n\`\`\`\n`);
+  }
+
+  if (chunk.executableCode) {
+    segments.push(`\n\`\`\`\n${chunk.executableCode}\n\`\`\`\n`);
+  }
+
+  const combined = segments.join('');
+  return combined ? sanitizeToolCallNarration(combined) : '';
+}
+
+function shouldSuppressToolInvocation(chunk) {
+  if (!chunk) {
+    return false;
+  }
+
+  if (chunk.functionCall || chunk.function_call) {
+    return true;
+  }
+
+  const candidate = chunk.candidates?.[0];
+  if (!candidate) {
+    return false;
+  }
+
+  const contents = Array.isArray(candidate.content) ? candidate.content : (candidate.content ? [candidate.content] : []);
+
+  for (const content of contents) {
+    if (typeof content?.role === 'string') {
+      const normalizedRole = content.role.toLowerCase();
+      if (normalizedRole && normalizedRole !== 'assistant' && normalizedRole !== 'model') {
+        return true;
+      }
+    }
+
+    const parts = Array.isArray(content?.parts) ? content.parts : [];
+    for (const part of parts) {
+      if (part?.functionCall || part?.function_call || part?.toolInvocation || part?.tool_invocation) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function sanitizeToolCallNarration(text) {
+  if (!text) {
+    return '';
+  }
+
+  const toolInvocationPattern = /\b(concise_search|google_search|web_search|search)\s*\(/i;
+  return text
+    .split(/\r?\n/)
+    .filter(line => !toolInvocationPattern.test(line.trim()))
+    .join('\n');
 }
 
 function updateEmbed(botMessage, finalResponse, message, groundingMetadata = null, urlContextMetadata = null) {
