@@ -594,14 +594,9 @@ function sanitizeFileName(fileName) {
     .replace(/^-+|-+$/g, '');
 }
 
-const octetStreamPrefixes = ['application/octet-stream', 'binary/octet-stream'];
-
 function resolveAttachmentContentType(attachment) {
   const directContentType = (attachment.contentType || '').toLowerCase();
-  if (
-    directContentType &&
-    !octetStreamPrefixes.some(prefix => directContentType.startsWith(prefix))
-  ) {
+  if (directContentType && directContentType !== 'application/octet-stream') {
     return directContentType;
   }
 
@@ -2202,20 +2197,12 @@ function extractDisplayTextFromChunk(chunk) {
     segments.push(chunk.text);
   }
 
-  const rawCodeOutput = chunk.codeExecutionResult?.output;
-  if (typeof rawCodeOutput === 'string') {
-    const trimmedOutput = rawCodeOutput.replace(/\s+$/u, '');
-    if (trimmedOutput.trim() !== '') {
-      segments.push(`\n\`\`\`py\n${trimmedOutput}\n\`\`\`\n`);
-    }
+  if (chunk.codeExecutionResult?.output) {
+    segments.push(`\n\`\`\`py\n${chunk.codeExecutionResult.output}\n\`\`\`\n`);
   }
 
-  const rawExecutableCode = chunk.executableCode;
-  if (typeof rawExecutableCode === 'string') {
-    const trimmedExecutable = rawExecutableCode.replace(/\s+$/u, '');
-    if (trimmedExecutable.trim() !== '') {
-      segments.push(`\n\`\`\`\n${trimmedExecutable}\n\`\`\`\n`);
-    }
+  if (chunk.executableCode) {
+    segments.push(`\n\`\`\`\n${chunk.executableCode}\n\`\`\`\n`);
   }
 
   const combined = segments.join('');
