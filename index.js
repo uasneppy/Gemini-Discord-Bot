@@ -2296,11 +2296,16 @@ function removeEmptyCodeFences(text) {
     '\n'
   );
 
-  return withoutEmptyFences
-    .replace(/\n{2,}/g, '\n')
+  const normalizedWhitespace = withoutEmptyFences
     .replace(/[ \t]+\n/g, '\n')
-    .replace(/[ \t]+$/g, '')
-    .trim();
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[ \t]+$/g, '');
+
+  if (normalizedWhitespace.trim() === '') {
+    return '';
+  }
+
+  return normalizedWhitespace;
 }
 
 function updateEmbed(botMessage, finalResponse, message, groundingMetadata = null, urlContextMetadata = null) {
