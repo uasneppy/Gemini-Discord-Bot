@@ -2071,7 +2071,9 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
         for await (const chunk of messageResult) {
           if (stopGeneration) break;
 
-          const chunkText = extractDisplayTextFromChunk(chunk);
+          const chunkText = extractDisplayTextFromChunk(chunk, {
+            stripLeadingNewlines: finalResponse.length === 0
+          });
           if (chunkText && chunkText !== '') {
             finalResponse += chunkText;
             tempResponse += chunkText;
@@ -2192,7 +2194,7 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
   }
 }
 
-function extractDisplayTextFromChunk(chunk) {
+function extractDisplayTextFromChunk(chunk, options = {}) {
   if (!chunk) {
     return '';
   }
@@ -2219,7 +2221,20 @@ function extractDisplayTextFromChunk(chunk) {
   }
 
   const combined = segments.join('');
-  return combined ? sanitizeToolCallNarration(combined) : '';
+  if (!combined) {
+    return '';
+  }
+
+  const sanitized = sanitizeToolCallNarration(combined);
+  if (!sanitized) {
+    return '';
+  }
+
+  if (options.stripLeadingNewlines) {
+    return sanitized.replace(/^\n+/, '');
+  }
+
+  return sanitized;
 }
 
 function shouldSuppressToolInvocation(chunk) {
@@ -2283,7 +2298,6 @@ function removeEmptyCodeFences(text) {
 
   return withoutEmptyFences
     .replace(/\n{3,}/g, '\n\n')
-    .replace(/^\n+/, '')
     .trimEnd();
 }
 
