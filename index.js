@@ -594,9 +594,14 @@ function sanitizeFileName(fileName) {
     .replace(/^-+|-+$/g, '');
 }
 
+const octetStreamPrefixes = ['application/octet-stream', 'binary/octet-stream'];
+
 function resolveAttachmentContentType(attachment) {
   const directContentType = (attachment.contentType || '').toLowerCase();
-  if (directContentType && directContentType !== 'application/octet-stream') {
+  if (
+    directContentType &&
+    !octetStreamPrefixes.some(prefix => directContentType.startsWith(prefix))
+  ) {
     return directContentType;
   }
 
@@ -2197,12 +2202,20 @@ function extractDisplayTextFromChunk(chunk) {
     segments.push(chunk.text);
   }
 
-  if (chunk.codeExecutionResult?.output) {
-    segments.push(`\n\`\`\`py\n${chunk.codeExecutionResult.output}\n\`\`\`\n`);
+  const rawCodeOutput = chunk.codeExecutionResult?.output;
+  if (typeof rawCodeOutput === 'string') {
+    const trimmedOutput = rawCodeOutput.replace(/\s+$/u, '');
+    if (trimmedOutput.trim() !== '') {
+      segments.push(`\n\`\`\`py\n${trimmedOutput}\n\`\`\`\n`);
+    }
   }
 
-  if (chunk.executableCode) {
-    segments.push(`\n\`\`\`\n${chunk.executableCode}\n\`\`\`\n`);
+  const rawExecutableCode = chunk.executableCode;
+  if (typeof rawExecutableCode === 'string') {
+    const trimmedExecutable = rawExecutableCode.replace(/\s+$/u, '');
+    if (trimmedExecutable.trim() !== '') {
+      segments.push(`\n\`\`\`\n${trimmedExecutable}\n\`\`\`\n`);
+    }
   }
 
   const combined = segments.join('');
@@ -2250,10 +2263,22 @@ function sanitizeToolCallNarration(text) {
   }
 
   const toolInvocationPattern = /\b(concise_search|google_search|web_search|search)\s*\(/i;
-  return text
+  const sanitizedText = text
     .split(/\r?\n/)
     .filter(line => !toolInvocationPattern.test(line.trim()))
     .join('\n');
+
+  return removeEmptyCodeFences(sanitizedText);
+}
+
+function removeEmptyCodeFences(text) {
+  if (!text) {
+    return '';
+  }
+
+  return text
+    .replace(/```[^\n]*\n(?:[ \t]*\n)*```/g, '')
+    .replace(/\n{3,}/g, '\n\n');
 }
 
 function updateEmbed(botMessage, finalResponse, message, groundingMetadata = null, urlContextMetadata = null) {
