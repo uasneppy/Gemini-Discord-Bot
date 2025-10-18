@@ -2278,11 +2278,11 @@ function removeEmptyCodeFences(text) {
 
   const withoutEmptyFences = text.replace(
     /(?:\n[ \t]*){0,2}```[^\n]*\n(?:[ \t]*\n)*```(?:[ \t]*\n){0,2}/g,
-    '\n'
+    '\n\n'
   );
 
   return withoutEmptyFences
-    .replace(/\n{2,}/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
     .replace(/^\n+/, '')
     .trimEnd();
 }
