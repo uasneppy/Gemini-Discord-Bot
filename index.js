@@ -593,14 +593,9 @@ function sanitizeFileName(fileName) {
     .replace(/^-+|-+$/g, '');
 }
 
-const octetStreamPrefixes = ['application/octet-stream', 'binary/octet-stream'];
-
 function resolveAttachmentContentType(attachment) {
   const directContentType = (attachment.contentType || '').toLowerCase();
-  if (
-    directContentType &&
-    !octetStreamPrefixes.some(prefix => directContentType.startsWith(prefix))
-  ) {
+  if (directContentType && directContentType !== 'application/octet-stream') {
     return directContentType;
   }
 
