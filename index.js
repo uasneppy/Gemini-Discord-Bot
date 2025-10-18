@@ -105,6 +105,7 @@ const defaultServerSettings = config.defaultServerSettings;
 const workInDMs = config.workInDMs;
 const shouldDisplayPersonalityButtons = config.shouldDisplayPersonalityButtons;
 const SEND_RETRY_ERRORS_TO_DISCORD = config.SEND_RETRY_ERRORS_TO_DISCORD;
+const showGroundingMetadata = config.showGroundingMetadata ?? true;
 
 
 
@@ -2279,7 +2280,7 @@ function shouldShowGroundingMetadata(message) {
     ? state.serverSettings[message.guild.id].responseStyle
     : getUserResponsePreference(userId);
   
-  return userResponsePreference === 'Embedded';
+  return showGroundingMetadata && userResponsePreference === 'Embedded';
 }
 
 async function sendAsTextFile(text, message, orgId) {
