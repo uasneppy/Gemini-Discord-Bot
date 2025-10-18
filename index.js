@@ -2293,13 +2293,14 @@ function removeEmptyCodeFences(text) {
 
   const withoutEmptyFences = text.replace(
     /(?:\n[ \t]*){0,2}```[^\n]*\n(?:[ \t]*\n)*```(?:[ \t]*\n){0,2}/g,
-    '\n\n'
+    '\n'
   );
 
   return withoutEmptyFences
-    .replace(/\n{3,}/g, '\n\n')
+    .replace(/\n{2,}/g, '\n')
     .replace(/[ \t]+\n/g, '\n')
-    .replace(/[ \t]+$/g, '');
+    .replace(/[ \t]+$/g, '')
+    .trim();
 }
 
 function updateEmbed(botMessage, finalResponse, message, groundingMetadata = null, urlContextMetadata = null) {
