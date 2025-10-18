@@ -2276,9 +2276,15 @@ function removeEmptyCodeFences(text) {
     return '';
   }
 
-  return text
-    .replace(/```[^\n]*\n(?:[ \t]*\n)*```/g, '')
-    .replace(/\n{3,}/g, '\n\n');
+  const withoutEmptyFences = text.replace(
+    /(?:\n[ \t]*){0,2}```[^\n]*\n(?:[ \t]*\n)*```(?:[ \t]*\n){0,2}/g,
+    '\n'
+  );
+
+  return withoutEmptyFences
+    .replace(/\n{2,}/g, '\n')
+    .replace(/^\n+/, '')
+    .trimEnd();
 }
 
 function updateEmbed(botMessage, finalResponse, message, groundingMetadata = null, urlContextMetadata = null) {
