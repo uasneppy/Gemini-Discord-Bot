@@ -3,6 +3,7 @@
   "dependencies": {
     "@google/genai": "*",
     "axios": "*",
+    "better-sqlite3": "*",
     "discord.js": "*",
     "dotenv": "*",
     "fs": "*",

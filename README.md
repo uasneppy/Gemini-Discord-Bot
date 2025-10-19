@@ -52,6 +52,23 @@ A Discord bot leveraging Google Gemini for advanced conversation, content unders
     npm start
     ```
 
+### Enable SQLite-backed history (optional)
+
+To switch to the lightweight SQLite context cache, install the native dependency and opt in via the environment variable:
+
+```bash
+npm install better-sqlite3
+```
+
+Add to your `.env` file:
+
+```
+USE_SQLITE_HISTORY=true
+# HISTORY_LIMIT=20  # Optional override for the number of messages to keep
+```
+
+The bot will create `history.db` in the project root; ensure the process user can read and write to this file.
+
 ---
 
 ## Usage
