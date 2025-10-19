@@ -52,6 +52,26 @@ import {
   initializeBlacklistForGuild
 } from './botManager.js';
 
+let pushHistoryMessage;
+let getHistoryMessages;
+let clearStoredHistory;
+const USE_SQLITE_HISTORY = process.env.USE_SQLITE_HISTORY === 'true';
+const parsedHistoryLimit = Number.parseInt(process.env.HISTORY_LIMIT ?? '', 10);
+const HISTORY_KEEP = Number.isInteger(parsedHistoryLimit) && parsedHistoryLimit > 0 ? parsedHistoryLimit : 20;
+
+if (USE_SQLITE_HISTORY) {
+  try {
+    const historyModule = await import('./store.js');
+    pushHistoryMessage = historyModule.pushMessage;
+    getHistoryMessages = historyModule.getLastMessages;
+    clearStoredHistory = historyModule.clearHistory;
+  } catch (error) {
+    console.error('Unable to load SQLite history module, continuing without it.', error);
+  }
+}
+
+const isSqliteHistoryActive = USE_SQLITE_HISTORY && pushHistoryMessage && getHistoryMessages && clearStoredHistory;
+
 initialize().catch(console.error);
 
 
@@ -262,6 +282,7 @@ async function handleCommandInteraction(interaction) {
     whitelist: handleWhitelistCommand,
     blacklist: handleBlacklistCommand,
     clear_memory: handleClearMemoryCommand,
+    forget: handleForgetCommand,
     settings: showSettings,
     server_settings: showDashboard,
     status: handleStatusCommand
@@ -379,6 +400,45 @@ async function handleClearMemoryCommand(interaction) {
     await interaction.reply({
       embeds: [embed]
     });
+  }
+}
+
+async function handleForgetCommand(interaction) {
+  try {
+    if (!isSqliteHistoryActive || !clearStoredHistory) {
+      const embed = new EmbedBuilder()
+        .setColor(0xFFA500)
+        .setTitle('SQLite History Disabled')
+        .setDescription('Set `USE_SQLITE_HISTORY=true` to enable persistent history.');
+      await interaction.reply({
+        embeds: [embed],
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+
+    const isDM = interaction.channel?.type === ChannelType.DM;
+    const guildId = isDM ? null : interaction.guild?.id ?? null;
+    const channelId = isDM ? null : interaction.channelId;
+
+    state.chatHistories[interaction.user.id] = {};
+    clearStoredHistory({
+      userId: interaction.user.id,
+      guildId,
+      channelId
+    });
+
+    const embed = new EmbedBuilder()
+      .setColor(0x00FF00)
+      .setTitle('Conversation Forgotten')
+      .setDescription('I have cleared our recent conversation history for this channel.');
+
+    await interaction.reply({
+      embeds: [embed],
+      flags: MessageFlags.Ephemeral
+    });
+  } catch (error) {
+    console.error('Error handling forget command:', error);
   }
 }
 
@@ -538,22 +598,67 @@ async function handleTextMessage(message) {
     { codeExecution: {} }
   ];
 
+  const isDirectMessage = message.channel.type === ChannelType.DM;
+  const storeGuildId = isDirectMessage ? null : guildId;
+  const storeChannelId = isDirectMessage ? null : channelId;
+  let systemPrompt = finalInstructions || defaultPersonality;
+  let chatHistory = getHistory(historyId);
+  let storeContext = null;
+
+  if (isSqliteHistoryActive) {
+    systemPrompt = `You are a helpful assistant.${finalInstructions ? `\n\n${finalInstructions}` : ''}`;
+    storeContext = {
+      userId,
+      guildId: storeGuildId,
+      channelId: storeChannelId
+    };
+    const clippedMessageForStore = messageContent.length > 1000 ? messageContent.slice(0, 1000) : messageContent;
+    pushHistoryMessage({
+      ...storeContext,
+      role: 'user',
+      content: clippedMessageForStore,
+      keep: HISTORY_KEEP
+    });
+
+    const storedHistory = getHistoryMessages({
+      ...storeContext,
+      limit: HISTORY_KEEP
+    });
+
+    const messagesForModel = [
+      { role: 'system', content: systemPrompt },
+      ...storedHistory.map((entry) => ({ ...entry }))
+    ];
+
+    const convertEntry = (entry) => ({
+      role: entry.role === 'assistant' ? 'model' : entry.role,
+      parts: [{ text: entry.content }]
+    });
+
+    const conversationEntries = messagesForModel.slice(1);
+    const previousEntries = conversationEntries.length > 0 && conversationEntries[conversationEntries.length - 1].role === 'user'
+      ? conversationEntries.slice(0, -1)
+      : conversationEntries;
+
+    chatHistory = previousEntries.map(convertEntry);
+  }
+
   // Create chat with new Google GenAI API format
   const chat = genAI.chats.create({
     model: MODEL,
     config: {
       systemInstruction: {
         role: "system",
-        parts: [{ text: finalInstructions || defaultPersonality }]
+        parts: [{ text: systemPrompt }]
       },
       ...generationConfig,
       safetySettings,
       tools
     },
-    history: getHistory(historyId)
+    history: chatHistory
   });
 
-  await handleModelResponse(botMessage, chat, parts, message, typingInterval, historyId);
+  await handleModelResponse(botMessage, chat, parts, message, typingInterval, historyId, storeContext);
 }
 
 function hasSupportedAttachments(message) {
@@ -770,6 +875,16 @@ async function handleModalSubmit(interaction) {
 async function clearChatHistory(interaction) {
   try {
     state.chatHistories[interaction.user.id] = {};
+    if (isSqliteHistoryActive && clearStoredHistory) {
+      const isDM = interaction.channel?.type === ChannelType.DM;
+      const guildId = isDM ? null : interaction.guild?.id ?? null;
+      const channelId = isDM ? null : interaction.channelId;
+      clearStoredHistory({
+        userId: interaction.user.id,
+        guildId,
+        channelId
+      });
+    }
     const embed = new EmbedBuilder()
       .setColor(0x00FF00)
       .setTitle('Chat History Cleared')
@@ -1954,7 +2069,7 @@ async function addSettingsButton(botMessage) {
 
 // <=====[Model Response Handling]=====>
 
-async function handleModelResponse(initialBotMessage, chat, parts, originalMessage, typingInterval, historyId) {
+async function handleModelResponse(initialBotMessage, chat, parts, originalMessage, typingInterval, historyId, storeContext) {
   const userId = originalMessage.author.id;
   const userResponsePreference = originalMessage.guild && state.serverSettings[originalMessage.guild.id]?.serverResponsePreference ? state.serverSettings[originalMessage.guild.id].responseStyle : getUserResponsePreference(userId);
   const maxCharacterLimit = userResponsePreference === 'Embedded' ? 3900 : 1900;
@@ -2140,6 +2255,17 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
         updateChatHistory(historyId, newHistory, botMessage.id);
         await saveStateToFile();
       });
+      if (isSqliteHistoryActive && storeContext && pushHistoryMessage) {
+        const clippedReply = finalResponse.length > 1000 ? finalResponse.slice(0, 1000) : finalResponse;
+        if (clippedReply && clippedReply.trim() !== '') {
+          pushHistoryMessage({
+            ...storeContext,
+            role: 'assistant',
+            content: clippedReply,
+            keep: HISTORY_KEEP
+          });
+        }
+      }
       break;
     } catch (error) {
       if (activeRequests.has(userId)) {

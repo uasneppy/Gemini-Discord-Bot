@@ -16,6 +16,10 @@ const commands = [
     description: "Clears the conversation history."
   },
   {
+    name: "forget",
+    description: "Clears the recent SQLite conversation context for this channel."
+  },
+  {
     name: "settings",
     description: "Opens Up Settings."
   },
