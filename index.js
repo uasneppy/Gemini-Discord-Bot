@@ -8,6 +8,7 @@ import {
   TextInputStyle,
   ModalBuilder,
   PermissionsBitField,
+  PermissionFlagsBits,
   EmbedBuilder,
   AttachmentBuilder,
   ActivityType,
@@ -18,11 +19,8 @@ import {
 import {
   HarmBlockThreshold,
   HarmCategory
-} from '@google/genai';
+} from '@google/generative-ai';
 import fs from 'fs/promises';
-import {
-  createWriteStream
-} from 'fs';
 import path from 'path';
 import {
   getTextExtractor
@@ -35,6 +33,7 @@ const {
 import axios from 'axios';
 
 import config from './config.js';
+import { parseDiscordAttachments, buildGeminiParts } from './bots/Fuku/utils/attachments.js';
 
 console.log('[BOOT] config:', path.resolve('./config.js'),
   'forceDefault=', !!config.forceDefault,
@@ -42,7 +41,6 @@ console.log('[BOOT] config:', path.resolve('./config.js'),
 import {
   client,
   genAI,
-  createPartFromUri,
   token,
   activeRequests,
   chatHistoryLock,
@@ -63,6 +61,111 @@ const USE_SQLITE_HISTORY = process.env.USE_SQLITE_HISTORY === 'true';
 const parsedHistoryLimit = Number.parseInt(process.env.HISTORY_LIMIT ?? '', 10);
 const HISTORY_KEEP = Number.isInteger(parsedHistoryLimit) && parsedHistoryLimit > 0 ? parsedHistoryLimit : 20;
 
+function canPostIn(channel, clientUser) {
+  if (!channel || !clientUser) {
+    return false;
+  }
+  if (channel.type === ChannelType.DM || channel.type === ChannelType.GroupDM) {
+    return true;
+  }
+  if (!channel.viewable) {
+    return false;
+  }
+  const permissions = typeof channel.permissionsFor === 'function'
+    ? channel.permissionsFor(clientUser)
+    : null;
+  if (!permissions) {
+    return false;
+  }
+  try {
+    return permissions.has([
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.ReadMessageHistory,
+    ]);
+  } catch (error) {
+    console.warn('[PERMISSIONS] Failed to evaluate channel permissions:', error?.message || error);
+    return false;
+  }
+}
+
+async function safeSendTyping(channel, clientUser) {
+  if (!canPostIn(channel, clientUser)) {
+    console.warn('[PERMISSIONS] Skipping typing indicator due to missing access.', {
+      channelId: channel?.id,
+    });
+    return false;
+  }
+  try {
+    await channel.sendTyping();
+    return true;
+  } catch (error) {
+    console.warn('[PERMISSIONS] Failed to send typing indicator:', error?.message || error);
+    return false;
+  }
+}
+
+async function safeReply(message, payload) {
+  if (!message) {
+    return null;
+  }
+  if (!canPostIn(message.channel, message.client.user)) {
+    console.warn('[PERMISSIONS] Skipping reply due to missing access.', {
+      channelId: message.channel?.id,
+    });
+    return null;
+  }
+  try {
+    return await message.reply(payload);
+  } catch (error) {
+    console.warn('[PERMISSIONS] Reply failed:', error?.message || error);
+    return null;
+  }
+}
+
+async function safeChannelSend(channel, clientUser, payload) {
+  if (!canPostIn(channel, clientUser)) {
+    console.warn('[PERMISSIONS] Skipping send due to missing access.', {
+      channelId: channel?.id,
+    });
+    return null;
+  }
+  try {
+    return await channel.send(payload);
+  } catch (error) {
+    console.warn('[PERMISSIONS] Channel send failed:', error?.message || error);
+    return null;
+  }
+}
+
+async function safeEditMessage(message, payload = {}) {
+  if (!message?.editable) {
+    return false;
+  }
+  try {
+    const { embeds, components, ...rest } = payload;
+    const normalizedEmbeds = Array.isArray(embeds)
+      ? embeds
+      : embeds
+        ? [embeds]
+        : [];
+    const normalizedComponents = Array.isArray(components)
+      ? components
+      : components
+        ? [components]
+        : [];
+    await message.edit({
+      ...rest,
+      embeds: normalizedEmbeds,
+      components: normalizedComponents,
+    });
+    return true;
+  } catch (error) {
+    console.warn('[MESSAGES] Edit failed:', error?.message || error);
+    return false;
+  }
+}
+
 if (USE_SQLITE_HISTORY) {
   try {
     const historyModule = await import('./store.js');
@@ -81,6 +184,10 @@ initialize().catch(console.error);
 
 // <=====[Configuration]=====>
 
+const configuredModel = config.geminiModel || "gemini-2.5-flash";
+if (configuredModel !== "gemini-2.5-flash") {
+  console.warn('[GEMINI] Configured model mismatch:', configuredModel, 'expected gemini-2.5-flash. Proceeding with gemini-2.5-flash.');
+}
 const MODEL = "gemini-2.5-flash";
 
 /*
@@ -136,34 +243,6 @@ import {
   delay,
   retryOperation,
 } from './tools/others.js';
-
-const extensionMimeTypeMap = {
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.png': 'image/png',
-  '.webp': 'image/webp',
-  '.bmp': 'image/bmp',
-  '.tiff': 'image/tiff',
-  '.svg': 'image/svg+xml',
-  '.heic': 'image/heic',
-  '.heif': 'image/heif',
-  '.mp3': 'audio/mpeg',
-  '.wav': 'audio/wav',
-  '.ogg': 'audio/ogg',
-  '.flac': 'audio/flac',
-  '.aac': 'audio/aac',
-  '.m4a': 'audio/mp4',
-  '.aif': 'audio/x-aiff',
-  '.aiff': 'audio/x-aiff',
-  '.opus': 'audio/ogg',
-  '.mp4': 'video/mp4',
-  '.mov': 'video/quicktime',
-  '.avi': 'video/x-msvideo',
-  '.mkv': 'video/x-matroska',
-  '.webm': 'video/webm',
-  '.wmv': 'video/x-ms-wmv',
-  '.pdf': 'application/pdf',
-};
 
 // <==========>
 
@@ -236,7 +315,7 @@ client.on('messageCreate', async (message) => {
             .setColor(0xFF0000)
             .setTitle('Blacklisted')
             .setDescription('You are blacklisted and cannot use this bot.');
-          return message.reply({
+          return safeReply(message, {
             embeds: [embed]
           });
         }
@@ -246,7 +325,7 @@ client.on('messageCreate', async (message) => {
           .setColor(0xFFFF00)
           .setTitle('Request In Progress')
           .setDescription('Please wait until your previous action is complete.');
-        await message.reply({
+        await safeReply(message, {
           embeds: [embed]
         });
       } else {
@@ -484,6 +563,13 @@ async function handleTextMessage(message) {
   const userId = message.author.id;
   const guildId = message.guild?.id;
   const channelId = message.channel.id;
+  if (!canPostIn(message.channel, message.client.user)) {
+    console.warn('[PERMISSIONS] Skipping message handling due to missing access.', {
+      channelId,
+      guildId,
+    });
+    return;
+  }
   let messageContent = message.content.replace(new RegExp(`<@!?${botId}>`), '').trim();
 
   let referencedText = '';
@@ -506,7 +592,9 @@ async function handleTextMessage(message) {
     }
   }
 
-  if (messageContent === '' && !(message.attachments.size > 0 && hasSupportedAttachments(message))) {
+  const attachmentInfo = parseDiscordAttachments(message);
+
+  if (messageContent === '' && !(attachmentInfo.hasImages || attachmentInfo.hasFiles)) {
     if (activeRequests.has(userId)) {
       activeRequests.delete(userId);
     }
@@ -514,24 +602,37 @@ async function handleTextMessage(message) {
       .setColor(0x00FFFF)
       .setTitle('Empty Message')
       .setDescription("It looks like you didn't say anything. What would you like to talk about?");
-    const botMessage = await message.reply({
+    const botMessage = await safeReply(message, {
       embeds: [embed]
     });
-    await addSettingsButton(botMessage);
+    if (botMessage) {
+      await addSettingsButton(botMessage);
+    }
     return;
   }
-  message.channel.sendTyping();
-  const typingInterval = setInterval(() => {
-    message.channel.sendTyping();
-  }, 4000);
-  setTimeout(() => {
-    clearInterval(typingInterval);
-  }, 120000);
-  let botMessage = false;
+  const typingAllowed = await safeSendTyping(message.channel, message.client.user);
+  const typingInterval = typingAllowed
+    ? setInterval(() => {
+      void safeSendTyping(message.channel, message.client.user);
+    }, 4000)
+    : null;
+  const typingTimeout = typingAllowed
+    ? setTimeout(() => {
+      if (typingInterval) {
+        clearInterval(typingInterval);
+      }
+    }, 120000)
+    : null;
+  let botMessage = null;
   let parts;
   try {
     if (SEND_RETRY_ERRORS_TO_DISCORD) {
-      clearInterval(typingInterval);
+      if (typingInterval) {
+        clearInterval(typingInterval);
+      }
+      if (typingTimeout) {
+        clearTimeout(typingTimeout);
+      }
       const updateEmbedDescription = (textAttachmentStatus, imageAttachmentStatus, finalText) => {
         return `Let me think...\n\n- ${textAttachmentStatus}: Text Attachment Check\n- ${imageAttachmentStatus}: Media Attachment Check\n${finalText || ''}`;
       };
@@ -540,7 +641,7 @@ async function handleTextMessage(message) {
         .setColor(0x00FFFF)
         .setTitle('Processing')
         .setDescription(updateEmbedDescription('[🔁]', '[🔁]'));
-      botMessage = await message.reply({
+      botMessage = await safeReply(message, {
         embeds: [embed]
       });
 
@@ -548,22 +649,26 @@ async function handleTextMessage(message) {
       const modelInput = referencedText
         ? `Context (previous message): ${referencedText}\n\nUser: ${messageContent}`
         : messageContent;
-      embed.setDescription(updateEmbedDescription('[☑️]', '[🔁]'));
-      await botMessage.edit({
-        embeds: [embed]
-      });
+      if (botMessage) {
+        embed.setDescription(updateEmbedDescription('[☑️]', '[🔁]'));
+        await safeEditMessage(botMessage, {
+          embeds: [embed]
+        });
+      }
 
-      parts = await processPromptAndMediaAttachments(modelInput, message);
-      embed.setDescription(updateEmbedDescription('[☑️]', '[☑️]', '### All checks done. Waiting for the response...'));
-      await botMessage.edit({
-        embeds: [embed]
-      });
+      parts = await processPromptAndMediaAttachments(modelInput, message, attachmentInfo);
+      if (botMessage) {
+        embed.setDescription(updateEmbedDescription('[☑️]', '[☑️]', '### All checks done. Waiting for the response...'));
+        await safeEditMessage(botMessage, {
+          embeds: [embed]
+        });
+      }
     } else {
       messageContent = await extractFileText(message, messageContent);
       const modelInput = referencedText
         ? `Context (previous message): ${referencedText}\n\nUser: ${messageContent}`
         : messageContent;
-      parts = await processPromptAndMediaAttachments(modelInput, message);
+      parts = await processPromptAndMediaAttachments(modelInput, message, attachmentInfo);
     }
   } catch (error) {
     return console.error('Error initialising message', error);
@@ -648,154 +753,81 @@ async function handleTextMessage(message) {
     chatHistory = previousEntries.map(convertEntry);
   }
 
-  // Create chat with new Google GenAI API format
-  const chat = genAI.chats.create({
+  // Create chat session with Gemini SDK
+  if (!genAI) {
+    console.warn('[GEMINI] No client available; skipping response generation.');
+    return;
+  }
+  const baseHistory = Array.isArray(chatHistory) ? chatHistory : [];
+  const model = genAI.getGenerativeModel({
     model: MODEL,
-    config: {
-      systemInstruction: {
-        role: "system",
-        parts: [{ text: systemPrompt }]
-      },
-      ...generationConfig,
-      safetySettings,
-      tools
+    generationConfig,
+    safetySettings,
+    systemInstruction: {
+      role: 'system',
+      parts: [{ text: systemPrompt }],
     },
-    history: chatHistory
+    tools,
   });
+  const chat = {
+    async sendMessageStream({ message: messageParts }) {
+      const contents = [
+        ...baseHistory,
+        { role: 'user', parts: messageParts },
+      ];
+      const result = await model.generateContentStream({ contents });
+      return result.stream;
+    },
+  };
 
   await handleModelResponse(botMessage, chat, parts, message, typingInterval, historyId, storeContext);
-}
-
-function hasSupportedAttachments(message) {
-  const supportedFileExtensions = ['.html', '.js', '.css', '.json', '.xml', '.csv', '.py', '.java', '.sql', '.log', '.md', '.txt', '.docx', '.pptx'];
-
-  return message.attachments.some((attachment) => {
-    const contentType = resolveAttachmentContentType(attachment);
-    const fileExtension = (path.extname(attachment.name) || '').toLowerCase();
-    return (
-      (contentType.startsWith('image/') && contentType !== 'image/gif') ||
-      contentType.startsWith('audio/') ||
-      contentType.startsWith('video/') ||
-      contentType.startsWith('application/pdf') ||
-      contentType.startsWith('application/x-pdf') ||
-      supportedFileExtensions.includes(fileExtension)
-    );
-  });
-}
-
-async function downloadFile(url, filePath) {
-  const writer = createWriteStream(filePath);
-  const response = await axios({
-    url,
-    method: 'GET',
-    responseType: 'stream',
-  });
-  response.data.pipe(writer);
-  return new Promise((resolve, reject) => {
-    writer.on('finish', resolve);
-    writer.on('error', reject);
-  });
-}
-
-function sanitizeFileName(fileName) {
-  return fileName
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
-
-const octetStreamPrefixes = ['application/octet-stream', 'binary/octet-stream'];
-
-function resolveAttachmentContentType(attachment) {
-  const directContentType = (attachment.contentType || '').toLowerCase();
-  if (
-    directContentType &&
-    !octetStreamPrefixes.some(prefix => directContentType.startsWith(prefix))
-  ) {
-    return directContentType;
+  if (typingInterval) {
+    clearInterval(typingInterval);
   }
-
-  const extension = (path.extname(attachment.name) || '').toLowerCase();
-  const mappedType = extensionMimeTypeMap[extension];
-  if (mappedType) {
-    return mappedType;
+  if (typingTimeout) {
+    clearTimeout(typingTimeout);
   }
-
-  return directContentType || '';
 }
 
-async function processPromptAndMediaAttachments(prompt, message) {
-  const attachments = JSON.parse(JSON.stringify(Array.from(message.attachments.values())));
-  let parts = [{
-    text: prompt
-  }];
-
-  if (attachments.length > 0) {
-    const validAttachments = attachments.filter(attachment => {
-      const contentType = resolveAttachmentContentType(attachment);
-      return (contentType.startsWith('image/') && contentType !== 'image/gif') ||
-        contentType.startsWith('audio/') ||
-        contentType.startsWith('video/') ||
-        contentType.startsWith('application/pdf') ||
-        contentType.startsWith('application/x-pdf');
+async function processPromptAndMediaAttachments(prompt, message, attachmentInfo) {
+  const summary = attachmentInfo ?? parseDiscordAttachments(message);
+  const apiKey = config.geminiApiKey || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
+  try {
+    const parts = await buildGeminiParts({
+      text: prompt,
+      images: summary.images,
+      files: summary.files,
+      apiKey
     });
 
-    if (validAttachments.length > 0) {
-      const attachmentParts = await Promise.all(
-        validAttachments.map(async (attachment) => {
-          const sanitizedFileName = sanitizeFileName(attachment.name);
-          const uniqueTempFilename = `${message.author.id}-${attachment.id}-${sanitizedFileName}`;
-          const filePath = path.join(TEMP_DIR, uniqueTempFilename);
+    const partKinds = parts.map((part) => {
+      if (part.text) return 'text';
+      if (part.inlineData) return `inline:${part.inlineData.mimeType || 'unknown'}`;
+      if (part.fileData) return `file:${part.fileData.mimeType || 'unknown'}`;
+      return 'unknown';
+    });
 
-          try {
-            await downloadFile(attachment.url, filePath);
-            // Upload file using new Google GenAI API format
-            const resolvedContentType = resolveAttachmentContentType(attachment);
-            const uploadResult = await genAI.files.upload({
-              file: filePath,
-              config: {
-                mimeType: resolvedContentType || 'application/octet-stream',
-                displayName: sanitizedFileName,
-              }
-            });
+    console.log('[LLM INPUT]', {
+      model: MODEL,
+      textChars: typeof prompt === 'string' ? prompt.length : 0,
+      partKinds,
+      attachments: {
+        imageCount: summary.images.length,
+        fileCount: summary.files.length,
+        images: summary.images.map(({ name, mimeType, size }) => ({ name, mimeType, size })),
+        files: summary.files.map(({ name, mimeType, size }) => ({ name, mimeType, size }))
+      }
+    });
 
-            const name = uploadResult.name;
-            if (name === null) {
-              throw new Error(`Unable to extract file name from upload result.`);
-            }
-
-            if (resolvedContentType.startsWith('video/')) {
-              // Wait for video processing to complete using new API
-              let file = await genAI.files.get({ name: name });
-              while (file.state === 'PROCESSING') {
-                process.stdout.write(".");
-                await new Promise((resolve) => setTimeout(resolve, 10_000));
-                file = await genAI.files.get({ name: name });
-              }
-              if (file.state === 'FAILED') {
-                throw new Error(`Video processing failed for ${sanitizedFileName}.`);
-              }
-            }
-
-            return createPartFromUri(uploadResult.uri, uploadResult.mimeType);
-          } catch (error) {
-            console.error(`Error processing attachment ${sanitizedFileName}:`, error);
-            return null;
-          } finally {
-            try {
-              await fs.unlink(filePath);
-            } catch (unlinkError) {
-              if (unlinkError.code !== 'ENOENT') {
-                console.error(`Error deleting temporary file ${filePath}:`, unlinkError);
-              }
-            }
-          }
-        })
-      );
-      parts = [...parts, ...attachmentParts.filter(part => part !== null)];
+    return parts;
+  } catch (error) {
+    console.error('[ATTACHMENTS] Failed to build Gemini parts:', error?.message || error);
+    const fallbackParts = [{ text: typeof prompt === 'string' ? prompt : '' }];
+    if ((summary.images.length + summary.files.length) > 0) {
+      fallbackParts.push({ text: 'One or more attachments could not be processed. Please try again or check the logs for details.' });
     }
+    return fallbackParts;
   }
-  return parts;
 }
 
 
@@ -1336,10 +1368,16 @@ async function downloadMessage(interaction) {
       await interaction.editReply({
         embeds: [updatedEmbed]
       });
+    } else if (response?.editable) {
+      try {
+        await response.edit({
+          embeds: [updatedEmbed]
+        });
+      } catch (editError) {
+        console.warn('Failed to update download response message:', editError?.message || editError);
+      }
     } else {
-      await response.edit({
-        embeds: [updatedEmbed]
-      });
+      console.warn('Download response message is not editable.');
     }
 
   } catch (error) {
@@ -1955,6 +1993,9 @@ async function showDashboard(interaction) {
 // <=====[Others]=====>
 
 async function addDownloadButton(botMessage) {
+  if (!botMessage) {
+    return botMessage;
+  }
   try {
     const messageComponents = botMessage.components || [];
     const downloadButton = new ButtonBuilder()
@@ -1971,16 +2012,19 @@ async function addDownloadButton(botMessage) {
     }
 
     actionRow.addComponents(downloadButton);
-    return await botMessage.edit({
+    await safeEditMessage(botMessage, {
       components: [actionRow]
     });
   } catch (error) {
     console.error('Error adding download button:', error.message);
-    return botMessage;
   }
+  return botMessage;
 }
 
 async function addDeleteButton(botMessage, msgId) {
+  if (!botMessage) {
+    return botMessage;
+  }
   try {
     const messageComponents = botMessage.components || [];
     const downloadButton = new ButtonBuilder()
@@ -1997,16 +2041,19 @@ async function addDeleteButton(botMessage, msgId) {
     }
 
     actionRow.addComponents(downloadButton);
-    return await botMessage.edit({
+    await safeEditMessage(botMessage, {
       components: [actionRow]
     });
   } catch (error) {
     console.error('Error adding delete button:', error.message);
-    return botMessage;
   }
+  return botMessage;
 }
 
 async function addSettingsButton(botMessage) {
+  if (!botMessage) {
+    return botMessage;
+  }
   try {
     const settingsButton = new ButtonBuilder()
       .setCustomId('settings')
@@ -2014,13 +2061,13 @@ async function addSettingsButton(botMessage) {
       .setStyle(ButtonStyle.Secondary);
 
     const actionRow = new ActionRowBuilder().addComponents(settingsButton);
-    return await botMessage.edit({
+    await safeEditMessage(botMessage, {
       components: [actionRow]
     });
   } catch (error) {
     console.log('Error adding settings button:', error.message);
-    return botMessage;
   }
+  return botMessage;
 }
 
 // <==========>
@@ -2050,77 +2097,85 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
     );
   let botMessage;
   if (!initialBotMessage) {
-    clearInterval(typingInterval);
-    try {
-      botMessage = await originalMessage.reply({
-        content: 'Let me think..',
-        components: [stopGeneratingButton]
-      });
-    } catch (error) {}
+    if (typingInterval) {
+      clearInterval(typingInterval);
+    }
+    botMessage = await safeReply(originalMessage, {
+      content: 'Let me think..',
+      components: [stopGeneratingButton]
+    });
   } else {
     botMessage = initialBotMessage;
-    try {
-      botMessage.edit({
+    if (typingInterval) {
+      clearInterval(typingInterval);
+    }
+    if (botMessage) {
+      await safeEditMessage(botMessage, {
         components: [stopGeneratingButton]
       });
-    } catch (error) {}
+    }
   }
 
   let stopGeneration = false;
   const filter = (interaction) => interaction.customId === 'stopGenerating';
-  try {
-    const collector = await botMessage.createMessageComponentCollector({
-      filter,
-      time: 120000
-    });
-    collector.on('collect', (interaction) => {
-      if (interaction.user.id === originalMessage.author.id) {
-        try {
-          const embed = new EmbedBuilder()
-            .setColor(0xFFA500)
-            .setTitle('Response Stopped')
-            .setDescription('Response generation stopped by the user.');
+  if (botMessage && typeof botMessage.createMessageComponentCollector === 'function') {
+    try {
+      const collector = await botMessage.createMessageComponentCollector({
+        filter,
+        time: 120000
+      });
+      collector.on('collect', (interaction) => {
+        if (interaction.user.id === originalMessage.author.id) {
+          try {
+            const embed = new EmbedBuilder()
+              .setColor(0xFFA500)
+              .setTitle('Response Stopped')
+              .setDescription('Response generation stopped by the user.');
 
-          interaction.reply({
-            embeds: [embed],
-            flags: MessageFlags.Ephemeral
-          });
-        } catch (error) {
-          console.error('Error sending reply:', error);
-        }
-        stopGeneration = true;
-      } else {
-        try {
-          const embed = new EmbedBuilder()
-            .setColor(0xFF0000)
-            .setTitle('Access Denied')
-            .setDescription("It's not for you.");
+            interaction.reply({
+              embeds: [embed],
+              flags: MessageFlags.Ephemeral
+            });
+          } catch (error) {
+            console.error('Error sending reply:', error);
+          }
+          stopGeneration = true;
+        } else {
+          try {
+            const embed = new EmbedBuilder()
+              .setColor(0xFF0000)
+              .setTitle('Access Denied')
+              .setDescription("It's not for you.");
 
-          interaction.reply({
-            embeds: [embed],
-            flags: MessageFlags.Ephemeral
-          });
-        } catch (error) {
-          console.error('Error sending unauthorized reply:', error);
+            interaction.reply({
+              embeds: [embed],
+              flags: MessageFlags.Ephemeral
+            });
+          } catch (error) {
+            console.error('Error sending unauthorized reply:', error);
+          }
         }
-      }
-    });
-  } catch (error) {
-    console.error('Error creating or handling collector:', error);
+      });
+    } catch (error) {
+      console.error('Error creating or handling collector:', error);
+    }
   }
 
   const updateMessage = () => {
     if (stopGeneration) {
       return;
     }
+    if (!botMessage) {
+      return;
+    }
     if (tempResponse.trim() === "") {
-      botMessage.edit({
+      void safeEditMessage(botMessage, {
         content: '...'
       });
     } else if (userResponsePreference === 'Embedded') {
       updateEmbed(botMessage, tempResponse, originalMessage, groundingMetadata, urlContextMetadata);
     } else {
-      botMessage.edit({
+      void safeEditMessage(botMessage, {
         content: tempResponse,
         embeds: []
       });
@@ -2147,7 +2202,8 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
           if (stopGeneration) break;
 
           const chunkText = extractDisplayTextFromChunk(chunk, {
-            stripLeadingNewlines: finalResponse.length === 0
+            stripLeadingNewlines: finalResponse.length === 0,
+            existingText: finalResponse
           });
           if (chunkText && chunkText !== '') {
             finalResponse += chunkText;
@@ -2173,9 +2229,11 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
                 .setTitle('Response Overflow')
                 .setDescription('The response got too large, will be sent as a text file once it is completed.');
 
-              botMessage.edit({
-                embeds: [embed]
-              });
+              if (botMessage) {
+                void safeEditMessage(botMessage, {
+                  embeds: [embed]
+                });
+              }
             }
           } else if (!updateTimeout) {
             updateTimeout = setTimeout(updateMessage, 500);
@@ -2191,7 +2249,7 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
       await getResponse(parts);
 
       // Final update to ensure grounding and URL context metadata is displayed in embedded responses
-      if (!isLargeResponse && userResponsePreference === 'Embedded') {
+      if (botMessage && !isLargeResponse && userResponsePreference === 'Embedded') {
         updateEmbed(botMessage, finalResponse, originalMessage, groundingMetadata, urlContextMetadata);
       }
 
@@ -2205,9 +2263,11 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
           botMessage = await addDownloadButton(botMessage);
           botMessage = await addDeleteButton(botMessage, botMessage.id);
         } else {
-          botMessage.edit({
-            components: []
-          });
+          if (botMessage) {
+            await safeEditMessage(botMessage, {
+              components: []
+            });
+          }
         }
       }
 
@@ -2241,28 +2301,36 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
               .setColor(0xFF0000)
               .setTitle('Generation Failure')
               .setDescription(`All Generation Attempts Failed :(\n\`\`\`${error.message}\`\`\``);
-            const errorMsg = await originalMessage.channel.send({
+            const errorMsg = await safeChannelSend(originalMessage.channel, originalMessage.client.user, {
               content: `<@${originalMessage.author.id}>`,
               embeds: [embed]
             });
-            await addSettingsButton(errorMsg);
-            await addSettingsButton(botMessage);
+            if (errorMsg) {
+              await addSettingsButton(errorMsg);
+            }
+            if (botMessage) {
+              await addSettingsButton(botMessage);
+            }
           } else {
             const simpleErrorEmbed = new EmbedBuilder()
               .setColor(0xFF0000)
               .setTitle('Bot Overloaded')
               .setDescription('Something seems off, the bot might be overloaded! :(');
-            const errorMsg = await originalMessage.channel.send({
+            const errorMsg = await safeChannelSend(originalMessage.channel, originalMessage.client.user, {
               content: `<@${originalMessage.author.id}>`,
               embeds: [simpleErrorEmbed]
             });
-            await addSettingsButton(errorMsg);
-            await addSettingsButton(botMessage);
+            if (errorMsg) {
+              await addSettingsButton(errorMsg);
+            }
+            if (botMessage) {
+              await addSettingsButton(botMessage);
+            }
           }
         }
         break;
       } else if (SEND_RETRY_ERRORS_TO_DISCORD) {
-        const errorMsg = await originalMessage.channel.send({
+        const errorMsg = await safeChannelSend(originalMessage.channel, originalMessage.client.user, {
           content: `<@${originalMessage.author.id}>`,
           embeds: [new EmbedBuilder()
             .setColor(0xFFFF00)
@@ -2270,7 +2338,11 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
             .setDescription(`Generation Attempt(s) Failed, Retrying..\n\`\`\`${error.message}\`\`\``)
           ]
         });
-        setTimeout(() => errorMsg.delete().catch(console.error), 5000);
+        if (errorMsg?.deletable) {
+          setTimeout(() => {
+            errorMsg.delete().catch(console.error);
+          }, 5000);
+        }
         await delay(500);
       }
     }
@@ -2286,8 +2358,50 @@ function extractDisplayTextFromChunk(chunk, options = {}) {
   }
 
   const segments = [];
-  if (!shouldSuppressToolInvocation(chunk) && chunk.text) {
-    segments.push(chunk.text);
+  if (!shouldSuppressToolInvocation(chunk)) {
+    let chunkText = '';
+    try {
+      if (typeof chunk.text === 'function') {
+        chunkText = chunk.text();
+      } else if (typeof chunk.text === 'string') {
+        chunkText = chunk.text;
+      } else {
+        const candidate = chunk.candidates?.[0];
+        if (candidate) {
+          const contents = Array.isArray(candidate.content)
+            ? candidate.content
+            : candidate.content
+              ? [candidate.content]
+              : [];
+          const collected = [];
+          for (const content of contents) {
+            const parts = Array.isArray(content.parts)
+              ? content.parts
+              : content.parts
+                ? [content.parts]
+                : [];
+            for (const part of parts) {
+              if (typeof part?.text === 'string') {
+                collected.push(part.text);
+              }
+            }
+          }
+          chunkText = collected.join('');
+        }
+      }
+    } catch (error) {
+      console.warn('[STREAM] Failed to extract chunk text:', error?.message || error);
+    }
+
+    if (chunkText && typeof options.existingText === 'string' && options.existingText.length > 0) {
+      if (chunkText.startsWith(options.existingText)) {
+        chunkText = chunkText.slice(options.existingText.length);
+      }
+    }
+
+    if (chunkText) {
+      segments.push(chunkText);
+    }
   }
 
   const rawCodeOutput = chunk.codeExecutionResult?.output;
@@ -2395,6 +2509,9 @@ function removeEmptyCodeFences(text) {
 }
 
 function updateEmbed(botMessage, finalResponse, message, groundingMetadata = null, urlContextMetadata = null) {
+  if (!botMessage) {
+    return;
+  }
   try {
     const isGuild = message.guild !== null;
     const embed = new EmbedBuilder()
@@ -2423,7 +2540,7 @@ function updateEmbed(botMessage, finalResponse, message, groundingMetadata = nul
       });
     }
 
-    botMessage.edit({
+    void safeEditMessage(botMessage, {
       content: ' ',
       embeds: [embed]
     });
@@ -2496,12 +2613,14 @@ async function sendAsTextFile(text, message, orgId) {
     const tempFilePath = path.join(TEMP_DIR, filename);
     await fs.writeFile(tempFilePath, text);
 
-    const botMessage = await message.channel.send({
+    const botMessage = await safeChannelSend(message.channel, message.client.user, {
       content: `<@${message.author.id}>, Here is the response:`,
       files: [tempFilePath]
     });
-    await addSettingsButton(botMessage);
-    await addDeleteButton(botMessage, orgId);
+    if (botMessage) {
+      await addSettingsButton(botMessage);
+      await addDeleteButton(botMessage, orgId);
+    }
 
     await fs.unlink(tempFilePath);
   } catch (error) {
