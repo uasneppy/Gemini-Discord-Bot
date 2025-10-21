@@ -2,6 +2,7 @@
   "type": "module",
   "dependencies": {
     "@google/genai": "*",
+    "@google/generative-ai": "*",
     "axios": "*",
     "better-sqlite3": "*",
     "discord.js": "*",

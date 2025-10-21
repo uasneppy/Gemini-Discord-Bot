@@ -20,9 +20,6 @@ import {
   HarmCategory
 } from '@google/genai';
 import fs from 'fs/promises';
-import {
-  createWriteStream
-} from 'fs';
 import path from 'path';
 import {
   getTextExtractor
@@ -35,6 +32,7 @@ const {
 import axios from 'axios';
 
 import config from './config.js';
+import { parseDiscordAttachments, buildGeminiParts } from './bots/Fuku/utils/attachments.js';
 
 console.log('[BOOT] config:', path.resolve('./config.js'),
   'forceDefault=', !!config.forceDefault,
@@ -42,7 +40,6 @@ console.log('[BOOT] config:', path.resolve('./config.js'),
 import {
   client,
   genAI,
-  createPartFromUri,
   token,
   activeRequests,
   chatHistoryLock,
@@ -81,6 +78,10 @@ initialize().catch(console.error);
 
 // <=====[Configuration]=====>
 
+const configuredModel = config.geminiModel || "gemini-2.5-flash";
+if (configuredModel !== "gemini-2.5-flash") {
+  console.warn('[GEMINI] Configured model mismatch:', configuredModel, 'expected gemini-2.5-flash. Proceeding with gemini-2.5-flash.');
+}
 const MODEL = "gemini-2.5-flash";
 
 /*
@@ -136,34 +137,6 @@ import {
   delay,
   retryOperation,
 } from './tools/others.js';
-
-const extensionMimeTypeMap = {
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.png': 'image/png',
-  '.webp': 'image/webp',
-  '.bmp': 'image/bmp',
-  '.tiff': 'image/tiff',
-  '.svg': 'image/svg+xml',
-  '.heic': 'image/heic',
-  '.heif': 'image/heif',
-  '.mp3': 'audio/mpeg',
-  '.wav': 'audio/wav',
-  '.ogg': 'audio/ogg',
-  '.flac': 'audio/flac',
-  '.aac': 'audio/aac',
-  '.m4a': 'audio/mp4',
-  '.aif': 'audio/x-aiff',
-  '.aiff': 'audio/x-aiff',
-  '.opus': 'audio/ogg',
-  '.mp4': 'video/mp4',
-  '.mov': 'video/quicktime',
-  '.avi': 'video/x-msvideo',
-  '.mkv': 'video/x-matroska',
-  '.webm': 'video/webm',
-  '.wmv': 'video/x-ms-wmv',
-  '.pdf': 'application/pdf',
-};
 
 // <==========>
 
@@ -506,7 +479,9 @@ async function handleTextMessage(message) {
     }
   }
 
-  if (messageContent === '' && !(message.attachments.size > 0 && hasSupportedAttachments(message))) {
+  const attachmentInfo = parseDiscordAttachments(message);
+
+  if (messageContent === '' && !(attachmentInfo.hasImages || attachmentInfo.hasFiles)) {
     if (activeRequests.has(userId)) {
       activeRequests.delete(userId);
     }
@@ -553,7 +528,7 @@ async function handleTextMessage(message) {
         embeds: [embed]
       });
 
-      parts = await processPromptAndMediaAttachments(modelInput, message);
+      parts = await processPromptAndMediaAttachments(modelInput, message, attachmentInfo);
       embed.setDescription(updateEmbedDescription('[☑️]', '[☑️]', '### All checks done. Waiting for the response...'));
       await botMessage.edit({
         embeds: [embed]
@@ -563,7 +538,7 @@ async function handleTextMessage(message) {
       const modelInput = referencedText
         ? `Context (previous message): ${referencedText}\n\nUser: ${messageContent}`
         : messageContent;
-      parts = await processPromptAndMediaAttachments(modelInput, message);
+      parts = await processPromptAndMediaAttachments(modelInput, message, attachmentInfo);
     }
   } catch (error) {
     return console.error('Error initialising message', error);
@@ -666,136 +641,45 @@ async function handleTextMessage(message) {
   await handleModelResponse(botMessage, chat, parts, message, typingInterval, historyId, storeContext);
 }
 
-function hasSupportedAttachments(message) {
-  const supportedFileExtensions = ['.html', '.js', '.css', '.json', '.xml', '.csv', '.py', '.java', '.sql', '.log', '.md', '.txt', '.docx', '.pptx'];
-
-  return message.attachments.some((attachment) => {
-    const contentType = resolveAttachmentContentType(attachment);
-    const fileExtension = (path.extname(attachment.name) || '').toLowerCase();
-    return (
-      (contentType.startsWith('image/') && contentType !== 'image/gif') ||
-      contentType.startsWith('audio/') ||
-      contentType.startsWith('video/') ||
-      contentType.startsWith('application/pdf') ||
-      contentType.startsWith('application/x-pdf') ||
-      supportedFileExtensions.includes(fileExtension)
-    );
-  });
-}
-
-async function downloadFile(url, filePath) {
-  const writer = createWriteStream(filePath);
-  const response = await axios({
-    url,
-    method: 'GET',
-    responseType: 'stream',
-  });
-  response.data.pipe(writer);
-  return new Promise((resolve, reject) => {
-    writer.on('finish', resolve);
-    writer.on('error', reject);
-  });
-}
-
-function sanitizeFileName(fileName) {
-  return fileName
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
-
-const octetStreamPrefixes = ['application/octet-stream', 'binary/octet-stream'];
-
-function resolveAttachmentContentType(attachment) {
-  const directContentType = (attachment.contentType || '').toLowerCase();
-  if (
-    directContentType &&
-    !octetStreamPrefixes.some(prefix => directContentType.startsWith(prefix))
-  ) {
-    return directContentType;
-  }
-
-  const extension = (path.extname(attachment.name) || '').toLowerCase();
-  const mappedType = extensionMimeTypeMap[extension];
-  if (mappedType) {
-    return mappedType;
-  }
-
-  return directContentType || '';
-}
-
-async function processPromptAndMediaAttachments(prompt, message) {
-  const attachments = JSON.parse(JSON.stringify(Array.from(message.attachments.values())));
-  let parts = [{
-    text: prompt
-  }];
-
-  if (attachments.length > 0) {
-    const validAttachments = attachments.filter(attachment => {
-      const contentType = resolveAttachmentContentType(attachment);
-      return (contentType.startsWith('image/') && contentType !== 'image/gif') ||
-        contentType.startsWith('audio/') ||
-        contentType.startsWith('video/') ||
-        contentType.startsWith('application/pdf') ||
-        contentType.startsWith('application/x-pdf');
+async function processPromptAndMediaAttachments(prompt, message, attachmentInfo) {
+  const summary = attachmentInfo ?? parseDiscordAttachments(message);
+  const apiKey = config.geminiApiKey || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
+  try {
+    const parts = await buildGeminiParts({
+      text: prompt,
+      images: summary.images,
+      files: summary.files,
+      apiKey
     });
 
-    if (validAttachments.length > 0) {
-      const attachmentParts = await Promise.all(
-        validAttachments.map(async (attachment) => {
-          const sanitizedFileName = sanitizeFileName(attachment.name);
-          const uniqueTempFilename = `${message.author.id}-${attachment.id}-${sanitizedFileName}`;
-          const filePath = path.join(TEMP_DIR, uniqueTempFilename);
+    const partKinds = parts.map((part) => {
+      if (part.text) return 'text';
+      if (part.inlineData) return `inline:${part.inlineData.mimeType || 'unknown'}`;
+      if (part.fileData) return `file:${part.fileData.mimeType || 'unknown'}`;
+      return 'unknown';
+    });
 
-          try {
-            await downloadFile(attachment.url, filePath);
-            // Upload file using new Google GenAI API format
-            const resolvedContentType = resolveAttachmentContentType(attachment);
-            const uploadResult = await genAI.files.upload({
-              file: filePath,
-              config: {
-                mimeType: resolvedContentType || 'application/octet-stream',
-                displayName: sanitizedFileName,
-              }
-            });
+    console.log('[LLM INPUT]', {
+      model: MODEL,
+      textChars: typeof prompt === 'string' ? prompt.length : 0,
+      partKinds,
+      attachments: {
+        imageCount: summary.images.length,
+        fileCount: summary.files.length,
+        images: summary.images.map(({ name, mimeType, size }) => ({ name, mimeType, size })),
+        files: summary.files.map(({ name, mimeType, size }) => ({ name, mimeType, size }))
+      }
+    });
 
-            const name = uploadResult.name;
-            if (name === null) {
-              throw new Error(`Unable to extract file name from upload result.`);
-            }
-
-            if (resolvedContentType.startsWith('video/')) {
-              // Wait for video processing to complete using new API
-              let file = await genAI.files.get({ name: name });
-              while (file.state === 'PROCESSING') {
-                process.stdout.write(".");
-                await new Promise((resolve) => setTimeout(resolve, 10_000));
-                file = await genAI.files.get({ name: name });
-              }
-              if (file.state === 'FAILED') {
-                throw new Error(`Video processing failed for ${sanitizedFileName}.`);
-              }
-            }
-
-            return createPartFromUri(uploadResult.uri, uploadResult.mimeType);
-          } catch (error) {
-            console.error(`Error processing attachment ${sanitizedFileName}:`, error);
-            return null;
-          } finally {
-            try {
-              await fs.unlink(filePath);
-            } catch (unlinkError) {
-              if (unlinkError.code !== 'ENOENT') {
-                console.error(`Error deleting temporary file ${filePath}:`, unlinkError);
-              }
-            }
-          }
-        })
-      );
-      parts = [...parts, ...attachmentParts.filter(part => part !== null)];
+    return parts;
+  } catch (error) {
+    console.error('[ATTACHMENTS] Failed to build Gemini parts:', error?.message || error);
+    const fallbackParts = [{ text: typeof prompt === 'string' ? prompt : '' }];
+    if ((summary.images.length + summary.files.length) > 0) {
+      fallbackParts.push({ text: 'One or more attachments could not be processed. Please try again or check the logs for details.' });
     }
+    return fallbackParts;
   }
-  return parts;
 }
 
 
