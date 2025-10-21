@@ -172,6 +172,25 @@ const FILE_PATHS = {
 let isSaving = false;
 let savePending = false;
 
+function sanitizePersonalityState() {
+  if (!config.forceDefault) {
+    return;
+  }
+
+  if (state.customInstructions && Object.keys(state.customInstructions).length > 0) {
+    state.customInstructions = {};
+  }
+
+  if (state.serverSettings && typeof state.serverSettings === 'object') {
+    for (const guildId of Object.keys(state.serverSettings)) {
+      const settings = state.serverSettings[guildId];
+      if (settings && typeof settings === 'object') {
+        settings.customServerPersonality = false;
+      }
+    }
+  }
+}
+
 export async function saveStateToFile() {
   if (isSaving) {
     savePending = true;
@@ -187,13 +206,36 @@ export async function saveStateToFile() {
       recursive: true
     });
 
+    sanitizePersonalityState();
+
     const chatHistoryPromises = Object.entries(chatHistories).map(([key, value]) => {
       const filePath = path.join(CHAT_HISTORIES_DIR, `${key}.json`);
       return fs.writeFile(filePath, JSON.stringify(value, null, 2), 'utf-8');
     });
 
     const filePromises = Object.entries(FILE_PATHS).map(([key, filePath]) => {
-      return fs.writeFile(filePath, JSON.stringify(state[key], null, 2), 'utf-8');
+      if (config.forceDefault && key === 'customInstructions') {
+        return Promise.resolve();
+      }
+
+      let data = state[key];
+
+      if (config.forceDefault) {
+        if (key === 'serverSettings' && data && typeof data === 'object') {
+          const sanitized = {};
+          for (const [guildId, settings] of Object.entries(data)) {
+            if (settings && typeof settings === 'object') {
+              sanitized[guildId] = {
+                ...settings,
+                customServerPersonality: false,
+              };
+            }
+          }
+          data = sanitized;
+        }
+      }
+
+      return fs.writeFile(filePath, JSON.stringify(data ?? {}, null, 2), 'utf-8');
     });
 
     await Promise.all([...chatHistoryPromises, ...filePromises]);
@@ -236,6 +278,11 @@ async function loadStateFromFile() {
     await Promise.all(chatHistoryPromises);
 
     const filePromises = Object.entries(FILE_PATHS).map(async ([key, filePath]) => {
+      if (config.forceDefault && key === 'customInstructions') {
+        state[key] = {};
+        return;
+      }
+
       try {
         const data = await fs.readFile(filePath, 'utf-8');
         state[key] = JSON.parse(data);
@@ -246,6 +293,8 @@ async function loadStateFromFile() {
       }
     });
     await Promise.all(filePromises);
+
+    sanitizePersonalityState();
 
   } catch (error) {
     console.error('Error loading state from files:', error);
