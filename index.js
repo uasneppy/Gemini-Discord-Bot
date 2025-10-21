@@ -775,8 +775,7 @@ async function handleTextMessage(message) {
         ...baseHistory,
         { role: 'user', parts: messageParts },
       ];
-      const result = await model.generateContentStream({ contents });
-      return result.stream;
+      return model.generateContentStream({ contents });
     },
   };
 
@@ -2198,7 +2197,7 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
         const messageResult = await chat.sendMessageStream({
           message: parts
         });
-        for await (const chunk of messageResult) {
+        for await (const chunk of messageResult.stream) {
           if (stopGeneration) break;
 
           const chunkText = extractDisplayTextFromChunk(chunk, {
@@ -2239,6 +2238,36 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
             updateTimeout = setTimeout(updateMessage, 500);
           }
         }
+        if (!finalResponse.trim()) {
+          try {
+            const aggregatedResponse = await messageResult.response;
+            const fallbackText = extractTextFromResponse(aggregatedResponse);
+            if (fallbackText) {
+              finalResponse = fallbackText;
+              tempResponse = fallbackText;
+              newResponse = fallbackText;
+              if (!groundingMetadata && aggregatedResponse?.candidates?.[0]?.groundingMetadata) {
+                groundingMetadata = aggregatedResponse.candidates[0].groundingMetadata;
+              }
+              if (!urlContextMetadata && aggregatedResponse?.candidates?.[0]?.url_context_metadata) {
+                urlContextMetadata = aggregatedResponse.candidates[0].url_context_metadata;
+              }
+              if (!isLargeResponse && !stopGeneration) {
+                if (userResponsePreference === 'Embedded') {
+                  updateEmbed(botMessage, fallbackText, originalMessage, groundingMetadata, urlContextMetadata);
+                } else if (botMessage) {
+                  await safeEditMessage(botMessage, {
+                    content: fallbackText,
+                    embeds: []
+                  });
+                }
+              }
+            }
+          } catch (error) {
+            console.warn('[STREAM] Failed to obtain aggregated response text:', error?.message || error);
+          }
+        }
+
         newHistory.push({
           role: 'assistant',
           content: [{
@@ -2435,6 +2464,37 @@ function extractDisplayTextFromChunk(chunk, options = {}) {
   }
 
   return sanitized;
+}
+
+function extractTextFromResponse(response) {
+  if (!response) {
+    return '';
+  }
+
+  const candidates = Array.isArray(response.candidates) ? response.candidates : [];
+  const segments = [];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const contents = Array.isArray(candidate.content)
+      ? candidate.content
+      : candidate.content
+        ? [candidate.content]
+        : [];
+    for (const content of contents) {
+      const parts = Array.isArray(content?.parts) ? content.parts : [];
+      for (const part of parts) {
+        if (typeof part?.text === 'string' && part.text.trim() !== '') {
+          segments.push(part.text);
+        }
+      }
+    }
+  }
+
+  if (segments.length === 0) {
+    return '';
+  }
+
+  return sanitizeToolCallNarration(segments.join(''));
 }
 
 function shouldSuppressToolInvocation(chunk) {
