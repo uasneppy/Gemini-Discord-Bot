@@ -2202,7 +2202,8 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
           if (stopGeneration) break;
 
           const chunkText = extractDisplayTextFromChunk(chunk, {
-            stripLeadingNewlines: finalResponse.length === 0
+            stripLeadingNewlines: finalResponse.length === 0,
+            existingText: finalResponse
           });
           if (chunkText && chunkText !== '') {
             finalResponse += chunkText;
@@ -2357,8 +2358,50 @@ function extractDisplayTextFromChunk(chunk, options = {}) {
   }
 
   const segments = [];
-  if (!shouldSuppressToolInvocation(chunk) && chunk.text) {
-    segments.push(chunk.text);
+  if (!shouldSuppressToolInvocation(chunk)) {
+    let chunkText = '';
+    try {
+      if (typeof chunk.text === 'function') {
+        chunkText = chunk.text();
+      } else if (typeof chunk.text === 'string') {
+        chunkText = chunk.text;
+      } else {
+        const candidate = chunk.candidates?.[0];
+        if (candidate) {
+          const contents = Array.isArray(candidate.content)
+            ? candidate.content
+            : candidate.content
+              ? [candidate.content]
+              : [];
+          const collected = [];
+          for (const content of contents) {
+            const parts = Array.isArray(content.parts)
+              ? content.parts
+              : content.parts
+                ? [content.parts]
+                : [];
+            for (const part of parts) {
+              if (typeof part?.text === 'string') {
+                collected.push(part.text);
+              }
+            }
+          }
+          chunkText = collected.join('');
+        }
+      }
+    } catch (error) {
+      console.warn('[STREAM] Failed to extract chunk text:', error?.message || error);
+    }
+
+    if (chunkText && typeof options.existingText === 'string' && options.existingText.length > 0) {
+      if (chunkText.startsWith(options.existingText)) {
+        chunkText = chunkText.slice(options.existingText.length);
+      }
+    }
+
+    if (chunkText) {
+      segments.push(chunkText);
+    }
   }
 
   const rawCodeOutput = chunk.codeExecutionResult?.output;
