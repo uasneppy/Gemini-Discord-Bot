@@ -113,10 +113,12 @@ export const state = {
     activeUsersInChannels = v;
   },
   get customInstructions() {
-    return customInstructions;
+    return config.forceDefault ? {} : customInstructions;
   },
   set customInstructions(v) {
-    customInstructions = v;
+    if (!config.forceDefault) {
+      customInstructions = v;
+    }
   },
   get serverSettings() {
     return serverSettings;
@@ -193,6 +195,9 @@ export async function saveStateToFile() {
     });
 
     const filePromises = Object.entries(FILE_PATHS).map(([key, filePath]) => {
+      if (config.forceDefault && key === 'customInstructions') {
+        return Promise.resolve();
+      }
       return fs.writeFile(filePath, JSON.stringify(state[key], null, 2), 'utf-8');
     });
 
@@ -236,9 +241,21 @@ async function loadStateFromFile() {
     await Promise.all(chatHistoryPromises);
 
     const filePromises = Object.entries(FILE_PATHS).map(async ([key, filePath]) => {
+      if (config.forceDefault && key === 'customInstructions') {
+        customInstructions = {};
+        return;
+      }
       try {
         const data = await fs.readFile(filePath, 'utf-8');
-        state[key] = JSON.parse(data);
+        const parsed = JSON.parse(data);
+        if (config.forceDefault && key === 'serverSettings' && parsed && typeof parsed === 'object') {
+          for (const value of Object.values(parsed)) {
+            if (value && typeof value === 'object') {
+              value.customServerPersonality = false;
+            }
+          }
+        }
+        state[key] = parsed;
       } catch (readError) {
         if (readError.code !== 'ENOENT') {
           console.error(`Error reading ${key} from ${filePath}:`, readError);
@@ -350,7 +367,7 @@ export function initializeBlacklistForGuild(guildId) {
       state.blacklistedUsers[guildId] = [];
     }
     if (!state.serverSettings[guildId]) {
-      state.serverSettings[guildId] = config.defaultServerSettings;
+      state.serverSettings[guildId] = JSON.parse(JSON.stringify(config.defaultServerSettings));
     }
   } catch (error) {}
 }

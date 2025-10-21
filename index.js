@@ -35,6 +35,10 @@ const {
 import axios from 'axios';
 
 import config from './config.js';
+
+console.log('[BOOT] config:', path.resolve('./config.js'),
+  'forceDefault=', !!config.forceDefault,
+  'buttons=', !!config.shouldDisplayPersonalityButtons);
 import {
   client,
   genAI,
@@ -123,7 +127,6 @@ const activities = config.activities.map(activity => ({
 const defaultPersonality = config.defaultPersonality;
 const defaultServerSettings = config.defaultServerSettings;
 const workInDMs = config.workInDMs;
-const shouldDisplayPersonalityButtons = config.shouldDisplayPersonalityButtons;
 const SEND_RETRY_ERRORS_TO_DISCORD = config.SEND_RETRY_ERRORS_TO_DISCORD;
 const showGroundingMetadata = config.showGroundingMetadata ?? true;
 
@@ -443,35 +446,11 @@ async function handleForgetCommand(interaction) {
 }
 
 async function handleCustomPersonalityCommand(interaction) {
-  const serverCustomEnabled = interaction.guild ? state.serverSettings[interaction.guild.id]?.customServerPersonality : false;
-  if (!serverCustomEnabled) {
-    await setCustomPersonality(interaction);
-  } else {
-    const embed = new EmbedBuilder()
-      .setColor(0xFF5555)
-      .setTitle('Feature Disabled')
-      .setDescription('Custom personality is not enabled for this server, Server-Wide personality is active.');
-    await interaction.reply({
-      embeds: [embed],
-      flags: MessageFlags.Ephemeral
-    });
-  }
+  await interaction.reply({ ephemeral: true, content: 'Custom personality is disabled by configuration.' });
 }
 
 async function handleRemovePersonalityCommand(interaction) {
-  const isServerEnabled = interaction.guild ? state.serverSettings[interaction.guild.id]?.customServerPersonality : false;
-  if (!isServerEnabled) {
-    await removeCustomPersonality(interaction);
-  } else {
-    const embed = new EmbedBuilder()
-      .setColor(0xFF5555)
-      .setTitle('Feature Disabled')
-      .setDescription('Custom personality is not enabled for this server, Server-Wide personality is active.');
-    await interaction.reply({
-      embeds: [embed],
-      flags: MessageFlags.Ephemeral
-    });
-  }
+  await interaction.reply({ ephemeral: true, content: 'Custom personality is disabled by configuration.' });
 }
 
 async function handleToggleResponseMode(interaction) {
@@ -627,12 +606,12 @@ async function handleTextMessage(message) {
   const isDirectMessage = message.channel.type === ChannelType.DM;
   const storeGuildId = isDirectMessage ? null : guildId;
   const storeChannelId = isDirectMessage ? null : channelId;
-  let systemPrompt = finalInstructions || defaultPersonality;
+  let systemPrompt = defaultPersonality;
   let chatHistory = getHistory(historyId);
   let storeContext = null;
 
   if (isSqliteHistoryActive) {
-    systemPrompt = `You are a helpful assistant.${finalInstructions ? `\n\n${finalInstructions}` : ''}`;
+    systemPrompt = defaultPersonality;
     storeContext = {
       userId,
       guildId: storeGuildId,
@@ -1524,37 +1503,7 @@ async function toggleServerWideChatHistory(interaction) {
 }
 
 async function toggleServerPersonality(interaction) {
-  try {
-    if (!interaction.guild) {
-      const embed = new EmbedBuilder()
-        .setColor(0xFF0000)
-        .setTitle('Server Command Only')
-        .setDescription('This command can only be used in a server.');
-      await interaction.reply({
-        embeds: [embed],
-        flags: MessageFlags.Ephemeral
-      });
-      return;
-    }
-
-    const serverId = interaction.guild.id;
-    initializeBlacklistForGuild(serverId);
-
-    state.serverSettings[serverId].customServerPersonality = !state.serverSettings[serverId].customServerPersonality;
-    const statusMessage = `Server-wide Personality is now \`${state.serverSettings[serverId].customServerPersonality ? "enabled" : "disabled"}\``;
-
-    const embed = new EmbedBuilder()
-      .setColor(state.serverSettings[serverId].customServerPersonality ? 0x00FF00 : 0xFF0000)
-      .setTitle('Server Personality Toggled')
-      .setDescription(statusMessage);
-
-    await interaction.reply({
-      embeds: [embed],
-      flags: MessageFlags.Ephemeral
-    });
-  } catch (error) {
-    console.log('Error toggling server-wide personality:', error.message);
-  }
+  await interaction.reply({ ephemeral: true, content: 'Server wide custom personality is disabled by configuration.' });
 }
 
 async function toggleServerResponsePreference(interaction) {
@@ -1626,23 +1575,7 @@ async function toggleSettingSaveButton(interaction) {
 }
 
 async function serverPersonality(interaction) {
-  const customId = 'custom-server-personality-input';
-  const title = 'Enter Custom Personality Instructions';
-
-  const input = new TextInputBuilder()
-    .setCustomId(customId)
-    .setLabel("What should the bot's personality be like?")
-    .setStyle(TextInputStyle.Paragraph)
-    .setPlaceholder("Enter the custom instructions here...")
-    .setMinLength(10)
-    .setMaxLength(4000);
-
-  const modal = new ModalBuilder()
-    .setCustomId('custom-server-personality-modal')
-    .setTitle(title)
-    .addComponents(new ActionRowBuilder().addComponents(input));
-
-  await interaction.showModal(modal);
+  await interaction.reply({ ephemeral: true, content: 'Server wide custom personality is disabled by configuration.' });
 }
 
 async function clearServerChatHistory(interaction) {
@@ -1867,12 +1800,12 @@ async function handleSubButtonInteraction(interaction, update = false) {
         emoji: '🗃️',
         style: ButtonStyle.Secondary
       },
-      ...(shouldDisplayPersonalityButtons ? [{
-          customId: 'custom-personality',
-          label: 'Custom Personality',
-          emoji: '🙌',
-          style: ButtonStyle.Primary
-        },
+      ...(config.shouldDisplayPersonalityButtons ? [{
+        customId: 'custom-personality',
+        label: 'Custom Personality',
+        emoji: '🙌',
+        style: ButtonStyle.Primary
+      },
         {
           customId: 'remove-personality',
           label: 'Remove Personality',
@@ -1956,18 +1889,19 @@ async function showDashboard(interaction) {
       emoji: "🔘",
       style: ButtonStyle.Primary,
     },
-    {
-      customId: "toggle-server-personality",
-      label: "Toggle Server Personality",
-      emoji: "🤖",
-      style: ButtonStyle.Primary,
-    },
-    {
-      customId: "custom-server-personality",
-      label: "Custom Server Personality",
-      emoji: "🙌",
-      style: ButtonStyle.Primary,
-    },
+    ...(config.shouldDisplayPersonalityButtons ? [{
+        customId: "toggle-server-personality",
+        label: "Toggle Server Personality",
+        emoji: "🤖",
+        style: ButtonStyle.Primary,
+      },
+      {
+        customId: "custom-server-personality",
+        label: "Custom Server Personality",
+        emoji: "🙌",
+        style: ButtonStyle.Primary,
+      },
+    ] : []),
     {
       customId: "toggle-response-server-mode",
       label: "Toggle Server-Wide Responses Style",
