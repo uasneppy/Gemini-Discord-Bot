@@ -800,7 +800,7 @@ async function processPromptAndMediaAttachments(prompt, message, attachmentInfo)
     });
 
     const partKinds = parts.map((part) => {
-      if (part.text) return 'text';
+      if (part.text !== undefined) return 'text';
       if (part.inlineData) return `inline:${part.inlineData.mimeType || 'unknown'}`;
       if (part.fileData) return `file:${part.fileData.mimeType || 'unknown'}`;
       return 'unknown';
@@ -809,12 +809,15 @@ async function processPromptAndMediaAttachments(prompt, message, attachmentInfo)
     console.log('[LLM INPUT]', {
       model: MODEL,
       textChars: typeof prompt === 'string' ? prompt.length : 0,
-      partKinds,
       attachments: {
         imageCount: summary.images.length,
         fileCount: summary.files.length,
         images: summary.images.map(({ name, mimeType, size }) => ({ name, mimeType, size })),
         files: summary.files.map(({ name, mimeType, size }) => ({ name, mimeType, size }))
+      },
+      partsSummary: {
+        totalParts: parts.length,
+        kinds: partKinds
       }
     });
 
