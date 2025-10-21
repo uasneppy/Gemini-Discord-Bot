@@ -8,6 +8,7 @@ import {
   TextInputStyle,
   ModalBuilder,
   PermissionsBitField,
+  PermissionFlagsBits,
   EmbedBuilder,
   AttachmentBuilder,
   ActivityType,
@@ -18,7 +19,7 @@ import {
 import {
   HarmBlockThreshold,
   HarmCategory
-} from '@google/genai';
+} from '@google/generative-ai';
 import fs from 'fs/promises';
 import path from 'path';
 import {
@@ -59,6 +60,111 @@ let clearStoredHistory;
 const USE_SQLITE_HISTORY = process.env.USE_SQLITE_HISTORY === 'true';
 const parsedHistoryLimit = Number.parseInt(process.env.HISTORY_LIMIT ?? '', 10);
 const HISTORY_KEEP = Number.isInteger(parsedHistoryLimit) && parsedHistoryLimit > 0 ? parsedHistoryLimit : 20;
+
+function canPostIn(channel, clientUser) {
+  if (!channel || !clientUser) {
+    return false;
+  }
+  if (channel.type === ChannelType.DM || channel.type === ChannelType.GroupDM) {
+    return true;
+  }
+  if (!channel.viewable) {
+    return false;
+  }
+  const permissions = typeof channel.permissionsFor === 'function'
+    ? channel.permissionsFor(clientUser)
+    : null;
+  if (!permissions) {
+    return false;
+  }
+  try {
+    return permissions.has([
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.ReadMessageHistory,
+    ]);
+  } catch (error) {
+    console.warn('[PERMISSIONS] Failed to evaluate channel permissions:', error?.message || error);
+    return false;
+  }
+}
+
+async function safeSendTyping(channel, clientUser) {
+  if (!canPostIn(channel, clientUser)) {
+    console.warn('[PERMISSIONS] Skipping typing indicator due to missing access.', {
+      channelId: channel?.id,
+    });
+    return false;
+  }
+  try {
+    await channel.sendTyping();
+    return true;
+  } catch (error) {
+    console.warn('[PERMISSIONS] Failed to send typing indicator:', error?.message || error);
+    return false;
+  }
+}
+
+async function safeReply(message, payload) {
+  if (!message) {
+    return null;
+  }
+  if (!canPostIn(message.channel, message.client.user)) {
+    console.warn('[PERMISSIONS] Skipping reply due to missing access.', {
+      channelId: message.channel?.id,
+    });
+    return null;
+  }
+  try {
+    return await message.reply(payload);
+  } catch (error) {
+    console.warn('[PERMISSIONS] Reply failed:', error?.message || error);
+    return null;
+  }
+}
+
+async function safeChannelSend(channel, clientUser, payload) {
+  if (!canPostIn(channel, clientUser)) {
+    console.warn('[PERMISSIONS] Skipping send due to missing access.', {
+      channelId: channel?.id,
+    });
+    return null;
+  }
+  try {
+    return await channel.send(payload);
+  } catch (error) {
+    console.warn('[PERMISSIONS] Channel send failed:', error?.message || error);
+    return null;
+  }
+}
+
+async function safeEditMessage(message, payload = {}) {
+  if (!message?.editable) {
+    return false;
+  }
+  try {
+    const { embeds, components, ...rest } = payload;
+    const normalizedEmbeds = Array.isArray(embeds)
+      ? embeds
+      : embeds
+        ? [embeds]
+        : [];
+    const normalizedComponents = Array.isArray(components)
+      ? components
+      : components
+        ? [components]
+        : [];
+    await message.edit({
+      ...rest,
+      embeds: normalizedEmbeds,
+      components: normalizedComponents,
+    });
+    return true;
+  } catch (error) {
+    console.warn('[MESSAGES] Edit failed:', error?.message || error);
+    return false;
+  }
+}
 
 if (USE_SQLITE_HISTORY) {
   try {
@@ -209,7 +315,7 @@ client.on('messageCreate', async (message) => {
             .setColor(0xFF0000)
             .setTitle('Blacklisted')
             .setDescription('You are blacklisted and cannot use this bot.');
-          return message.reply({
+          return safeReply(message, {
             embeds: [embed]
           });
         }
@@ -219,7 +325,7 @@ client.on('messageCreate', async (message) => {
           .setColor(0xFFFF00)
           .setTitle('Request In Progress')
           .setDescription('Please wait until your previous action is complete.');
-        await message.reply({
+        await safeReply(message, {
           embeds: [embed]
         });
       } else {
@@ -457,6 +563,13 @@ async function handleTextMessage(message) {
   const userId = message.author.id;
   const guildId = message.guild?.id;
   const channelId = message.channel.id;
+  if (!canPostIn(message.channel, message.client.user)) {
+    console.warn('[PERMISSIONS] Skipping message handling due to missing access.', {
+      channelId,
+      guildId,
+    });
+    return;
+  }
   let messageContent = message.content.replace(new RegExp(`<@!?${botId}>`), '').trim();
 
   let referencedText = '';
@@ -489,24 +602,37 @@ async function handleTextMessage(message) {
       .setColor(0x00FFFF)
       .setTitle('Empty Message')
       .setDescription("It looks like you didn't say anything. What would you like to talk about?");
-    const botMessage = await message.reply({
+    const botMessage = await safeReply(message, {
       embeds: [embed]
     });
-    await addSettingsButton(botMessage);
+    if (botMessage) {
+      await addSettingsButton(botMessage);
+    }
     return;
   }
-  message.channel.sendTyping();
-  const typingInterval = setInterval(() => {
-    message.channel.sendTyping();
-  }, 4000);
-  setTimeout(() => {
-    clearInterval(typingInterval);
-  }, 120000);
-  let botMessage = false;
+  const typingAllowed = await safeSendTyping(message.channel, message.client.user);
+  const typingInterval = typingAllowed
+    ? setInterval(() => {
+      void safeSendTyping(message.channel, message.client.user);
+    }, 4000)
+    : null;
+  const typingTimeout = typingAllowed
+    ? setTimeout(() => {
+      if (typingInterval) {
+        clearInterval(typingInterval);
+      }
+    }, 120000)
+    : null;
+  let botMessage = null;
   let parts;
   try {
     if (SEND_RETRY_ERRORS_TO_DISCORD) {
-      clearInterval(typingInterval);
+      if (typingInterval) {
+        clearInterval(typingInterval);
+      }
+      if (typingTimeout) {
+        clearTimeout(typingTimeout);
+      }
       const updateEmbedDescription = (textAttachmentStatus, imageAttachmentStatus, finalText) => {
         return `Let me think...\n\n- ${textAttachmentStatus}: Text Attachment Check\n- ${imageAttachmentStatus}: Media Attachment Check\n${finalText || ''}`;
       };
@@ -515,7 +641,7 @@ async function handleTextMessage(message) {
         .setColor(0x00FFFF)
         .setTitle('Processing')
         .setDescription(updateEmbedDescription('[🔁]', '[🔁]'));
-      botMessage = await message.reply({
+      botMessage = await safeReply(message, {
         embeds: [embed]
       });
 
@@ -523,16 +649,20 @@ async function handleTextMessage(message) {
       const modelInput = referencedText
         ? `Context (previous message): ${referencedText}\n\nUser: ${messageContent}`
         : messageContent;
-      embed.setDescription(updateEmbedDescription('[☑️]', '[🔁]'));
-      await botMessage.edit({
-        embeds: [embed]
-      });
+      if (botMessage) {
+        embed.setDescription(updateEmbedDescription('[☑️]', '[🔁]'));
+        await safeEditMessage(botMessage, {
+          embeds: [embed]
+        });
+      }
 
       parts = await processPromptAndMediaAttachments(modelInput, message, attachmentInfo);
-      embed.setDescription(updateEmbedDescription('[☑️]', '[☑️]', '### All checks done. Waiting for the response...'));
-      await botMessage.edit({
-        embeds: [embed]
-      });
+      if (botMessage) {
+        embed.setDescription(updateEmbedDescription('[☑️]', '[☑️]', '### All checks done. Waiting for the response...'));
+        await safeEditMessage(botMessage, {
+          embeds: [embed]
+        });
+      }
     } else {
       messageContent = await extractFileText(message, messageContent);
       const modelInput = referencedText
@@ -623,22 +753,40 @@ async function handleTextMessage(message) {
     chatHistory = previousEntries.map(convertEntry);
   }
 
-  // Create chat with new Google GenAI API format
-  const chat = genAI.chats.create({
+  // Create chat session with Gemini SDK
+  if (!genAI) {
+    console.warn('[GEMINI] No client available; skipping response generation.');
+    return;
+  }
+  const baseHistory = Array.isArray(chatHistory) ? chatHistory : [];
+  const model = genAI.getGenerativeModel({
     model: MODEL,
-    config: {
-      systemInstruction: {
-        role: "system",
-        parts: [{ text: systemPrompt }]
-      },
-      ...generationConfig,
-      safetySettings,
-      tools
+    generationConfig,
+    safetySettings,
+    systemInstruction: {
+      role: 'system',
+      parts: [{ text: systemPrompt }],
     },
-    history: chatHistory
+    tools,
   });
+  const chat = {
+    async sendMessageStream({ message: messageParts }) {
+      const contents = [
+        ...baseHistory,
+        { role: 'user', parts: messageParts },
+      ];
+      const result = await model.generateContentStream({ contents });
+      return result.stream;
+    },
+  };
 
   await handleModelResponse(botMessage, chat, parts, message, typingInterval, historyId, storeContext);
+  if (typingInterval) {
+    clearInterval(typingInterval);
+  }
+  if (typingTimeout) {
+    clearTimeout(typingTimeout);
+  }
 }
 
 async function processPromptAndMediaAttachments(prompt, message, attachmentInfo) {
@@ -1220,10 +1368,16 @@ async function downloadMessage(interaction) {
       await interaction.editReply({
         embeds: [updatedEmbed]
       });
+    } else if (response?.editable) {
+      try {
+        await response.edit({
+          embeds: [updatedEmbed]
+        });
+      } catch (editError) {
+        console.warn('Failed to update download response message:', editError?.message || editError);
+      }
     } else {
-      await response.edit({
-        embeds: [updatedEmbed]
-      });
+      console.warn('Download response message is not editable.');
     }
 
   } catch (error) {
@@ -1839,6 +1993,9 @@ async function showDashboard(interaction) {
 // <=====[Others]=====>
 
 async function addDownloadButton(botMessage) {
+  if (!botMessage) {
+    return botMessage;
+  }
   try {
     const messageComponents = botMessage.components || [];
     const downloadButton = new ButtonBuilder()
@@ -1855,16 +2012,19 @@ async function addDownloadButton(botMessage) {
     }
 
     actionRow.addComponents(downloadButton);
-    return await botMessage.edit({
+    await safeEditMessage(botMessage, {
       components: [actionRow]
     });
   } catch (error) {
     console.error('Error adding download button:', error.message);
-    return botMessage;
   }
+  return botMessage;
 }
 
 async function addDeleteButton(botMessage, msgId) {
+  if (!botMessage) {
+    return botMessage;
+  }
   try {
     const messageComponents = botMessage.components || [];
     const downloadButton = new ButtonBuilder()
@@ -1881,16 +2041,19 @@ async function addDeleteButton(botMessage, msgId) {
     }
 
     actionRow.addComponents(downloadButton);
-    return await botMessage.edit({
+    await safeEditMessage(botMessage, {
       components: [actionRow]
     });
   } catch (error) {
     console.error('Error adding delete button:', error.message);
-    return botMessage;
   }
+  return botMessage;
 }
 
 async function addSettingsButton(botMessage) {
+  if (!botMessage) {
+    return botMessage;
+  }
   try {
     const settingsButton = new ButtonBuilder()
       .setCustomId('settings')
@@ -1898,13 +2061,13 @@ async function addSettingsButton(botMessage) {
       .setStyle(ButtonStyle.Secondary);
 
     const actionRow = new ActionRowBuilder().addComponents(settingsButton);
-    return await botMessage.edit({
+    await safeEditMessage(botMessage, {
       components: [actionRow]
     });
   } catch (error) {
     console.log('Error adding settings button:', error.message);
-    return botMessage;
   }
+  return botMessage;
 }
 
 // <==========>
@@ -1934,77 +2097,85 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
     );
   let botMessage;
   if (!initialBotMessage) {
-    clearInterval(typingInterval);
-    try {
-      botMessage = await originalMessage.reply({
-        content: 'Let me think..',
-        components: [stopGeneratingButton]
-      });
-    } catch (error) {}
+    if (typingInterval) {
+      clearInterval(typingInterval);
+    }
+    botMessage = await safeReply(originalMessage, {
+      content: 'Let me think..',
+      components: [stopGeneratingButton]
+    });
   } else {
     botMessage = initialBotMessage;
-    try {
-      botMessage.edit({
+    if (typingInterval) {
+      clearInterval(typingInterval);
+    }
+    if (botMessage) {
+      await safeEditMessage(botMessage, {
         components: [stopGeneratingButton]
       });
-    } catch (error) {}
+    }
   }
 
   let stopGeneration = false;
   const filter = (interaction) => interaction.customId === 'stopGenerating';
-  try {
-    const collector = await botMessage.createMessageComponentCollector({
-      filter,
-      time: 120000
-    });
-    collector.on('collect', (interaction) => {
-      if (interaction.user.id === originalMessage.author.id) {
-        try {
-          const embed = new EmbedBuilder()
-            .setColor(0xFFA500)
-            .setTitle('Response Stopped')
-            .setDescription('Response generation stopped by the user.');
+  if (botMessage && typeof botMessage.createMessageComponentCollector === 'function') {
+    try {
+      const collector = await botMessage.createMessageComponentCollector({
+        filter,
+        time: 120000
+      });
+      collector.on('collect', (interaction) => {
+        if (interaction.user.id === originalMessage.author.id) {
+          try {
+            const embed = new EmbedBuilder()
+              .setColor(0xFFA500)
+              .setTitle('Response Stopped')
+              .setDescription('Response generation stopped by the user.');
 
-          interaction.reply({
-            embeds: [embed],
-            flags: MessageFlags.Ephemeral
-          });
-        } catch (error) {
-          console.error('Error sending reply:', error);
-        }
-        stopGeneration = true;
-      } else {
-        try {
-          const embed = new EmbedBuilder()
-            .setColor(0xFF0000)
-            .setTitle('Access Denied')
-            .setDescription("It's not for you.");
+            interaction.reply({
+              embeds: [embed],
+              flags: MessageFlags.Ephemeral
+            });
+          } catch (error) {
+            console.error('Error sending reply:', error);
+          }
+          stopGeneration = true;
+        } else {
+          try {
+            const embed = new EmbedBuilder()
+              .setColor(0xFF0000)
+              .setTitle('Access Denied')
+              .setDescription("It's not for you.");
 
-          interaction.reply({
-            embeds: [embed],
-            flags: MessageFlags.Ephemeral
-          });
-        } catch (error) {
-          console.error('Error sending unauthorized reply:', error);
+            interaction.reply({
+              embeds: [embed],
+              flags: MessageFlags.Ephemeral
+            });
+          } catch (error) {
+            console.error('Error sending unauthorized reply:', error);
+          }
         }
-      }
-    });
-  } catch (error) {
-    console.error('Error creating or handling collector:', error);
+      });
+    } catch (error) {
+      console.error('Error creating or handling collector:', error);
+    }
   }
 
   const updateMessage = () => {
     if (stopGeneration) {
       return;
     }
+    if (!botMessage) {
+      return;
+    }
     if (tempResponse.trim() === "") {
-      botMessage.edit({
+      void safeEditMessage(botMessage, {
         content: '...'
       });
     } else if (userResponsePreference === 'Embedded') {
       updateEmbed(botMessage, tempResponse, originalMessage, groundingMetadata, urlContextMetadata);
     } else {
-      botMessage.edit({
+      void safeEditMessage(botMessage, {
         content: tempResponse,
         embeds: []
       });
@@ -2057,9 +2228,11 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
                 .setTitle('Response Overflow')
                 .setDescription('The response got too large, will be sent as a text file once it is completed.');
 
-              botMessage.edit({
-                embeds: [embed]
-              });
+              if (botMessage) {
+                void safeEditMessage(botMessage, {
+                  embeds: [embed]
+                });
+              }
             }
           } else if (!updateTimeout) {
             updateTimeout = setTimeout(updateMessage, 500);
@@ -2075,7 +2248,7 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
       await getResponse(parts);
 
       // Final update to ensure grounding and URL context metadata is displayed in embedded responses
-      if (!isLargeResponse && userResponsePreference === 'Embedded') {
+      if (botMessage && !isLargeResponse && userResponsePreference === 'Embedded') {
         updateEmbed(botMessage, finalResponse, originalMessage, groundingMetadata, urlContextMetadata);
       }
 
@@ -2089,9 +2262,11 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
           botMessage = await addDownloadButton(botMessage);
           botMessage = await addDeleteButton(botMessage, botMessage.id);
         } else {
-          botMessage.edit({
-            components: []
-          });
+          if (botMessage) {
+            await safeEditMessage(botMessage, {
+              components: []
+            });
+          }
         }
       }
 
@@ -2125,28 +2300,36 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
               .setColor(0xFF0000)
               .setTitle('Generation Failure')
               .setDescription(`All Generation Attempts Failed :(\n\`\`\`${error.message}\`\`\``);
-            const errorMsg = await originalMessage.channel.send({
+            const errorMsg = await safeChannelSend(originalMessage.channel, originalMessage.client.user, {
               content: `<@${originalMessage.author.id}>`,
               embeds: [embed]
             });
-            await addSettingsButton(errorMsg);
-            await addSettingsButton(botMessage);
+            if (errorMsg) {
+              await addSettingsButton(errorMsg);
+            }
+            if (botMessage) {
+              await addSettingsButton(botMessage);
+            }
           } else {
             const simpleErrorEmbed = new EmbedBuilder()
               .setColor(0xFF0000)
               .setTitle('Bot Overloaded')
               .setDescription('Something seems off, the bot might be overloaded! :(');
-            const errorMsg = await originalMessage.channel.send({
+            const errorMsg = await safeChannelSend(originalMessage.channel, originalMessage.client.user, {
               content: `<@${originalMessage.author.id}>`,
               embeds: [simpleErrorEmbed]
             });
-            await addSettingsButton(errorMsg);
-            await addSettingsButton(botMessage);
+            if (errorMsg) {
+              await addSettingsButton(errorMsg);
+            }
+            if (botMessage) {
+              await addSettingsButton(botMessage);
+            }
           }
         }
         break;
       } else if (SEND_RETRY_ERRORS_TO_DISCORD) {
-        const errorMsg = await originalMessage.channel.send({
+        const errorMsg = await safeChannelSend(originalMessage.channel, originalMessage.client.user, {
           content: `<@${originalMessage.author.id}>`,
           embeds: [new EmbedBuilder()
             .setColor(0xFFFF00)
@@ -2154,7 +2337,11 @@ async function handleModelResponse(initialBotMessage, chat, parts, originalMessa
             .setDescription(`Generation Attempt(s) Failed, Retrying..\n\`\`\`${error.message}\`\`\``)
           ]
         });
-        setTimeout(() => errorMsg.delete().catch(console.error), 5000);
+        if (errorMsg?.deletable) {
+          setTimeout(() => {
+            errorMsg.delete().catch(console.error);
+          }, 5000);
+        }
         await delay(500);
       }
     }
@@ -2279,6 +2466,9 @@ function removeEmptyCodeFences(text) {
 }
 
 function updateEmbed(botMessage, finalResponse, message, groundingMetadata = null, urlContextMetadata = null) {
+  if (!botMessage) {
+    return;
+  }
   try {
     const isGuild = message.guild !== null;
     const embed = new EmbedBuilder()
@@ -2307,7 +2497,7 @@ function updateEmbed(botMessage, finalResponse, message, groundingMetadata = nul
       });
     }
 
-    botMessage.edit({
+    void safeEditMessage(botMessage, {
       content: ' ',
       embeds: [embed]
     });
@@ -2380,12 +2570,14 @@ async function sendAsTextFile(text, message, orgId) {
     const tempFilePath = path.join(TEMP_DIR, filename);
     await fs.writeFile(tempFilePath, text);
 
-    const botMessage = await message.channel.send({
+    const botMessage = await safeChannelSend(message.channel, message.client.user, {
       content: `<@${message.author.id}>, Here is the response:`,
       files: [tempFilePath]
     });
-    await addSettingsButton(botMessage);
-    await addDeleteButton(botMessage, orgId);
+    if (botMessage) {
+      await addSettingsButton(botMessage);
+      await addDeleteButton(botMessage, orgId);
+    }
 
     await fs.unlink(tempFilePath);
   } catch (error) {

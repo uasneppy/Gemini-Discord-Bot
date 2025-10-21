@@ -5,11 +5,7 @@ import {
   GatewayIntentBits,
   Partials
 } from 'discord.js';
-import {
-  GoogleGenAI,
-  createUserContent,
-  createPartFromUri
-} from '@google/genai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import fs from 'fs/promises';
 import path from 'path';
 import {
@@ -19,7 +15,6 @@ import {
 import config from './config.js';
 
 // --- Core Client and API Initialization ---
-// Using new Google GenAI library instead of deprecated @google/generative-ai
 
 export const client = new Client({
   intents: [
@@ -45,8 +40,7 @@ const resolvedGeminiKey = config.geminiApiKey || process.env.GOOGLE_API_KEY;
 if (!resolvedGeminiKey) {
   console.warn('[GEMINI] No API key configured. Attachment uploads will be unavailable.');
 }
-export const genAI = new GoogleGenAI({ apiKey: resolvedGeminiKey });
-export { createUserContent, createPartFromUri };
+export const genAI = resolvedGeminiKey ? new GoogleGenerativeAI(resolvedGeminiKey) : null;
 export const token = process.env.DISCORD_BOT_TOKEN;
 
 // --- Concurrency and Request Management ---
@@ -275,18 +269,29 @@ async function loadStateFromFile() {
 
 // --- Daily Cleanup and Initialization ---
 
+const toArray = (value) => {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (value == null) {
+    return [];
+  }
+  return [value];
+};
+
 function removeFileData(histories) {
   try {
-    Object.values(histories).forEach(subIdEntries => {
-      subIdEntries.forEach(message => {
-        if (message.content) {
-          message.content = message.content.filter(contentItem => {
-            if (contentItem.fileData) {
-              delete contentItem.fileData;
-            }
-            return Object.keys(contentItem).length > 0;
-          });
+    Object.values(histories ?? {}).forEach((subIdEntries) => {
+      toArray(subIdEntries).forEach((message) => {
+        if (!message || !Array.isArray(message.content)) {
+          return;
         }
+        message.content = message.content.filter((contentItem) => {
+          if (contentItem?.fileData) {
+            delete contentItem.fileData;
+          }
+          return contentItem && Object.keys(contentItem).length > 0;
+        });
       });
     });
     console.log('fileData elements have been removed from chat histories.');

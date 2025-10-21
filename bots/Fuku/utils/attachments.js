@@ -168,13 +168,13 @@ export async function uploadToGeminiFileAPI({ buffer, mimeType, name, apiKey }) 
       displayName: name || fileName
     });
     const uploadedFile = uploadResponse?.file ?? uploadResponse;
-    const fileUri = uploadedFile?.uri || uploadedFile?.fileUri || uploadedFile?.name;
-    if (!fileUri) {
+    const fileHandle = uploadedFile?.name || uploadedFile?.uri || uploadedFile?.fileUri;
+    if (!fileHandle) {
       throw new Error('Upload response did not include a file URI.');
     }
     return {
       fileData: {
-        fileUri,
+        fileUri: fileHandle,
         mimeType: mimeType || uploadedFile?.mimeType || 'application/octet-stream'
       }
     };
