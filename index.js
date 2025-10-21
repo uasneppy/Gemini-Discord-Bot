@@ -507,6 +507,26 @@ async function handleTextMessage(message) {
   const channelId = message.channel.id;
   let messageContent = message.content.replace(new RegExp(`<@!?${botId}>`), '').trim();
 
+  let referencedText = '';
+
+  if (message.reference?.messageId) {
+    try {
+      const original = await message.fetchReference();
+      if (original?.content?.trim()) {
+        referencedText = original.content.trim();
+      }
+    } catch (e) {
+      try {
+        const original = await message.channel.messages.fetch(message.reference.messageId);
+        if (original?.content?.trim()) {
+          referencedText = original.content.trim();
+        }
+      } catch (err) {
+        console.warn('[reply-context] Could not fetch referenced message:', err?.message || err);
+      }
+    }
+  }
+
   if (messageContent === '' && !(message.attachments.size > 0 && hasSupportedAttachments(message))) {
     if (activeRequests.has(userId)) {
       activeRequests.delete(userId);
@@ -546,19 +566,25 @@ async function handleTextMessage(message) {
       });
 
       messageContent = await extractFileText(message, messageContent);
+      const modelInput = referencedText
+        ? `Context (previous message): ${referencedText}\n\nUser: ${messageContent}`
+        : messageContent;
       embed.setDescription(updateEmbedDescription('[☑️]', '[🔁]'));
       await botMessage.edit({
         embeds: [embed]
       });
 
-      parts = await processPromptAndMediaAttachments(messageContent, message);
+      parts = await processPromptAndMediaAttachments(modelInput, message);
       embed.setDescription(updateEmbedDescription('[☑️]', '[☑️]', '### All checks done. Waiting for the response...'));
       await botMessage.edit({
         embeds: [embed]
       });
     } else {
       messageContent = await extractFileText(message, messageContent);
-      parts = await processPromptAndMediaAttachments(messageContent, message);
+      const modelInput = referencedText
+        ? `Context (previous message): ${referencedText}\n\nUser: ${messageContent}`
+        : messageContent;
+      parts = await processPromptAndMediaAttachments(modelInput, message);
     }
   } catch (error) {
     return console.error('Error initialising message', error);
