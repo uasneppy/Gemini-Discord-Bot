@@ -2,6 +2,8 @@ export default {
   defaultResponseFormat: "Normal",
   hexColour: "#505050",
   workInDMs: true,
+  geminiModel: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+  geminiApiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "",
   shouldDisplayPersonalityButtons: false,
   forceDefault: true,
   SEND_RETRY_ERRORS_TO_DISCORD: false,
