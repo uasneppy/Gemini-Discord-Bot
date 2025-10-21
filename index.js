@@ -123,9 +123,12 @@ const activities = config.activities.map(activity => ({
 const defaultPersonality = config.defaultPersonality;
 const defaultServerSettings = config.defaultServerSettings;
 const workInDMs = config.workInDMs;
-const shouldDisplayPersonalityButtons = config.shouldDisplayPersonalityButtons;
+const forceDefaultPersonality = Boolean(config.forceDefault);
+const shouldDisplayPersonalityButtons = config.shouldDisplayPersonalityButtons && !forceDefaultPersonality;
 const SEND_RETRY_ERRORS_TO_DISCORD = config.SEND_RETRY_ERRORS_TO_DISCORD;
 const showGroundingMetadata = config.showGroundingMetadata ?? true;
+
+const PERSONA_DISABLED_MESSAGE = 'Custom personality is disabled by the admin.';
 
 
 
@@ -163,6 +166,20 @@ const extensionMimeTypeMap = {
 };
 
 // <==========>
+
+
+async function replyWithPersonalityDisabled(interaction) {
+  const payload = {
+    content: PERSONA_DISABLED_MESSAGE,
+    flags: MessageFlags.Ephemeral,
+  };
+
+  if (interaction.replied || interaction.deferred) {
+    return interaction.followUp(payload);
+  }
+
+  return interaction.reply(payload);
+}
 
 
 
@@ -313,12 +330,17 @@ async function handleButtonInteraction(interaction) {
     }
   }
 
+  const customPersonalityHandler = forceDefaultPersonality ? replyWithPersonalityDisabled : handleCustomPersonalityCommand;
+  const removePersonalityHandler = forceDefaultPersonality ? replyWithPersonalityDisabled : handleRemovePersonalityCommand;
+  const serverPersonalityHandler = forceDefaultPersonality ? replyWithPersonalityDisabled : serverPersonality;
+  const toggleServerPersonalityHandler = forceDefaultPersonality ? replyWithPersonalityDisabled : toggleServerPersonality;
+
   const buttonHandlers = {
     'server-chat-history': toggleServerWideChatHistory,
     'clear-server': clearServerChatHistory,
     'settings-save-buttons': toggleSettingSaveButton,
-    'custom-server-personality': serverPersonality,
-    'toggle-server-personality': toggleServerPersonality,
+    'custom-server-personality': serverPersonalityHandler,
+    'toggle-server-personality': toggleServerPersonalityHandler,
     'download-server-conversation': downloadServerConversation,
     'response-server-mode': toggleServerPreference,
     'toggle-response-server-mode': toggleServerResponsePreference,
@@ -326,8 +348,8 @@ async function handleButtonInteraction(interaction) {
     'back_to_main_settings': editShowSettings,
     'clear-memory': handleClearMemoryCommand,
     'always-respond': alwaysRespond,
-    'custom-personality': handleCustomPersonalityCommand,
-    'remove-personality': handleRemovePersonalityCommand,
+    'custom-personality': customPersonalityHandler,
+    'remove-personality': removePersonalityHandler,
     'toggle-response-mode': handleToggleResponseMode,
     'download-conversation': downloadConversation,
     'download_message': downloadMessage,
@@ -443,6 +465,10 @@ async function handleForgetCommand(interaction) {
 }
 
 async function handleCustomPersonalityCommand(interaction) {
+  if (forceDefaultPersonality) {
+    return replyWithPersonalityDisabled(interaction);
+  }
+
   const serverCustomEnabled = interaction.guild ? state.serverSettings[interaction.guild.id]?.customServerPersonality : false;
   if (!serverCustomEnabled) {
     await setCustomPersonality(interaction);
@@ -459,6 +485,10 @@ async function handleCustomPersonalityCommand(interaction) {
 }
 
 async function handleRemovePersonalityCommand(interaction) {
+  if (forceDefaultPersonality) {
+    return replyWithPersonalityDisabled(interaction);
+  }
+
   const isServerEnabled = interaction.guild ? state.serverSettings[interaction.guild.id]?.customServerPersonality : false;
   if (!isServerEnabled) {
     await removeCustomPersonality(interaction);
@@ -590,31 +620,8 @@ async function handleTextMessage(message) {
     return console.error('Error initialising message', error);
   }
 
-  let instructions;
-  if (guildId) {
-    if (state.channelWideChatHistory[channelId]) {
-      instructions = state.customInstructions[channelId];
-    } else if (state.serverSettings[guildId]?.customServerPersonality && state.customInstructions[guildId]) {
-      instructions = state.customInstructions[guildId];
-    } else {
-      instructions = state.customInstructions[userId];
-    }
-  } else {
-    instructions = state.customInstructions[userId];
-  }
-
-  let infoStr = '';
-  if (guildId) {
-    const userInfo = {
-      username: message.author.username,
-      displayName: message.author.displayName
-    };
-    infoStr = `\nYou are currently engaging with users in the ${message.guild.name} Discord server.\n\n## Current User Information\nUsername: \`${userInfo.username}\`\nDisplay Name: \`${userInfo.displayName}\``;
-  }
-
   const isServerChatHistoryEnabled = guildId ? state.serverSettings[guildId]?.serverChatHistory : false;
   const isChannelChatHistoryEnabled = guildId ? state.channelWideChatHistory[channelId] : false;
-  const finalInstructions = isServerChatHistoryEnabled ? instructions + infoStr : instructions;
   const historyId = isChannelChatHistoryEnabled ? (isServerChatHistoryEnabled ? guildId : channelId) : userId;
 
   // Always enable all three tools: Google Search, URL Context, and Code Execution
@@ -627,12 +634,11 @@ async function handleTextMessage(message) {
   const isDirectMessage = message.channel.type === ChannelType.DM;
   const storeGuildId = isDirectMessage ? null : guildId;
   const storeChannelId = isDirectMessage ? null : channelId;
-  let systemPrompt = finalInstructions || defaultPersonality;
+  let systemPrompt = defaultPersonality;
   let chatHistory = getHistory(historyId);
   let storeContext = null;
 
   if (isSqliteHistoryActive) {
-    systemPrompt = `You are a helpful assistant.${finalInstructions ? `\n\n${finalInstructions}` : ''}`;
     storeContext = {
       userId,
       guildId: storeGuildId,
@@ -668,6 +674,11 @@ async function handleTextMessage(message) {
 
     chatHistory = previousEntries.map(convertEntry);
   }
+
+  console.log('[PERSONA DEBUG]', {
+    usingDefault: systemPrompt === defaultPersonality,
+    preview: systemPrompt.slice(0, 80),
+  });
 
   // Create chat with new Google GenAI API format
   const chat = genAI.chats.create({
@@ -863,6 +874,11 @@ async function downloadAndReadFile(url, fileType) {
 // <=====[Interaction Reply]=====>
 
 async function handleModalSubmit(interaction) {
+  if (forceDefaultPersonality) {
+    await replyWithPersonalityDisabled(interaction);
+    return;
+  }
+
   if (interaction.customId === 'custom-personality-modal') {
     try {
       const customInstructionsInput = interaction.fields.getTextInputValue('custom-personality-input');
@@ -1040,7 +1056,9 @@ async function toggleChannelChatHistory(interaction) {
 
     if (enabled) {
       state.channelWideChatHistory[channelId] = true;
-      state.customInstructions[channelId] = instructions;
+      if (!forceDefaultPersonality) {
+        state.customInstructions[channelId] = instructions;
+      }
 
       const enabledEmbed = new EmbedBuilder()
         .setColor(0x00FF00)
@@ -1260,6 +1278,10 @@ async function handleWhitelistCommand(interaction) {
 }
 
 async function setCustomPersonality(interaction) {
+  if (forceDefaultPersonality) {
+    return replyWithPersonalityDisabled(interaction);
+  }
+
   const customId = 'custom-personality-input';
   const title = 'Enter Custom Personality Instructions';
 
@@ -1457,6 +1479,10 @@ async function downloadConversation(interaction) {
 
 
 async function removeCustomPersonality(interaction) {
+  if (forceDefaultPersonality) {
+    return replyWithPersonalityDisabled(interaction);
+  }
+
   try {
     delete state.customInstructions[interaction.user.id];
     const embed = new EmbedBuilder()
@@ -1504,15 +1530,10 @@ async function toggleServerWideChatHistory(interaction) {
     state.serverSettings[serverId].serverChatHistory = !state.serverSettings[serverId].serverChatHistory;
     const statusMessage = `Server-wide Chat History is now \`${state.serverSettings[serverId].serverChatHistory ? "enabled" : "disabled"}\``;
 
-    let warningMessage = "";
-    if (state.serverSettings[serverId].serverChatHistory && !state.serverSettings[serverId].customServerPersonality) {
-      warningMessage = "\n\n⚠️ **Warning:** Enabling server-side chat history without enhancing server-wide personality management is not recommended. The bot may get confused between its personalities and conversations with different users.";
-    }
-
     const embed = new EmbedBuilder()
       .setColor(state.serverSettings[serverId].serverChatHistory ? 0x00FF00 : 0xFF0000)
       .setTitle('Chat History Toggled')
-      .setDescription(statusMessage + warningMessage);
+      .setDescription(statusMessage);
 
     await interaction.reply({
       embeds: [embed],
@@ -1524,6 +1545,10 @@ async function toggleServerWideChatHistory(interaction) {
 }
 
 async function toggleServerPersonality(interaction) {
+  if (forceDefaultPersonality) {
+    return replyWithPersonalityDisabled(interaction);
+  }
+
   try {
     if (!interaction.guild) {
       const embed = new EmbedBuilder()
@@ -1626,6 +1651,10 @@ async function toggleSettingSaveButton(interaction) {
 }
 
 async function serverPersonality(interaction) {
+  if (forceDefaultPersonality) {
+    return replyWithPersonalityDisabled(interaction);
+  }
+
   const customId = 'custom-server-personality-input';
   const title = 'Enter Custom Personality Instructions';
 
@@ -1956,18 +1985,19 @@ async function showDashboard(interaction) {
       emoji: "🔘",
       style: ButtonStyle.Primary,
     },
-    {
-      customId: "toggle-server-personality",
-      label: "Toggle Server Personality",
-      emoji: "🤖",
-      style: ButtonStyle.Primary,
-    },
-    {
-      customId: "custom-server-personality",
-      label: "Custom Server Personality",
-      emoji: "🙌",
-      style: ButtonStyle.Primary,
-    },
+    ...(forceDefaultPersonality ? [] : [{
+        customId: "toggle-server-personality",
+        label: "Toggle Server Personality",
+        emoji: "🤖",
+        style: ButtonStyle.Primary,
+      },
+      {
+        customId: "custom-server-personality",
+        label: "Custom Server Personality",
+        emoji: "🙌",
+        style: ButtonStyle.Primary,
+      },
+    ]),
     {
       customId: "toggle-response-server-mode",
       label: "Toggle Server-Wide Responses Style",
